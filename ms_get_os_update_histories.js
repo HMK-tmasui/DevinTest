@@ -84,6 +84,7 @@ try {
             seen.add(key);
             
             const parsed = parseUpdateText(linkText);
+            if (!parsed.kb) return;
             results.push({
                 text: linkText,
                 href: href,
