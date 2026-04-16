@@ -2,7 +2,6 @@
 using HscTool.Shared;
 using HvnDbVerifier.Model.Json;
 using System;
-using System.Collections.Concurrent;
 using System.Collections.Frozen;
 using System.Collections.Generic;
 using System.Data;
@@ -57,12 +56,6 @@ public class MySqlVerifierService
 		list.Add(value);
 	}
 
-	/// <summary>ConcurrentDictionary版: スレッドセーフなリスト辞書追加</summary>
-	private static void AddToListConcurrent<TKey, TVal>(ConcurrentDictionary<TKey, List<TVal>> dict, TKey key, TVal value) where TKey : notnull
-	{
-		var list = dict.GetOrAdd(key, _ => new List<TVal>(4));
-		lock (list) { list.Add(value); }
-	}
 
 	/// <summary>カラム値を比較用文字列に変換（DateTime は秒単位に正規化）</summary>
 	private static string FormatColumnValue(object? val)
@@ -575,8 +568,6 @@ public class MySqlVerifierService
 			var matchedSrcRows = matchedSrcTask.Result;
 			var matchedTgtRows = matchedTgtTask.Result;
 
-			// AlternativeKey 生成用の FrozenSet で高速 Contains チェック
-			var altKeySet = alternativeKey.ToFrozenSet(StringComparer.OrdinalIgnoreCase);
 			string AltKey(Dictionary<string, object?> row)
 			{
 				var sb = new StringBuilder(64);
@@ -1071,7 +1062,7 @@ public class MySqlVerifierService
 			{
 				whereClause = string.Join(" OR ", batch.Select(k =>
 				{
-					var parts = k.Split("||");
+					var parts = k.Split("|");
 					var conds = parts.Select((p, idx) =>
 						$"`{pkColumns[idx]}` = '{p.Split('=', 2).Last().Replace("'", "''")}'");
 					return $"({string.Join(" AND ", conds)})";
