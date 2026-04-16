@@ -2,6 +2,7 @@
 using HscTool.Shared;
 using HvnDbVerifier.Model.Json;
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Frozen;
 using System.Collections.Generic;
 using System.Data;
@@ -22,6 +23,9 @@ public class MySqlVerifierService
 	private readonly MySqlVerifierSettings _settings;
 	private readonly Dictionary<string, IncludeTableConfig> _includeTableConfigs;
 	private readonly FrozenSet<string> _includeTableNames;
+
+	/// <summary>並列フェッチの最大同時実行数</summary>
+	private const int MaxParallelFetches = 4;
 
 	private IDbContextFactory _srcFactory;
 	private IDbContextFactory _tgtFactory;
@@ -47,10 +51,17 @@ public class MySqlVerifierService
 	{
 		if (!dict.TryGetValue(key, out var list))
 		{
-			list = new List<TVal>();
+			list = new List<TVal>(4); // 初期容量を小さく設定
 			dict[key] = list;
 		}
 		list.Add(value);
+	}
+
+	/// <summary>ConcurrentDictionary版: スレッドセーフなリスト辞書追加</summary>
+	private static void AddToListConcurrent<TKey, TVal>(ConcurrentDictionary<TKey, List<TVal>> dict, TKey key, TVal value) where TKey : notnull
+	{
+		var list = dict.GetOrAdd(key, _ => new List<TVal>(4));
+		lock (list) { list.Add(value); }
 	}
 
 	/// <summary>カラム値を比較用文字列に変換（DateTime は秒単位に正規化）</summary>
@@ -340,35 +351,52 @@ public class MySqlVerifierService
 		var pkSelect = string.Join(", ", pkColumns.Select(c => $"{prefix}`{c}`"));
 		var sql = $"SELECT {pkSelect} FROM {fromClause}{joinClause}{whereClause} ORDER BY {pkSelect}";
 
-		var sourceKeys = await GetPkSetAsync(srcConnection, sql, pkColumns);
+		// 並列フェッチ: ソースとターゲットの PK セットを同時取得
+		var srcTask = GetPkSetAsync(srcConnection, sql, pkColumns);
+		var tgtTask = GetPkSetAsync(tgtConnection, sql, pkColumns);
+		await Task.WhenAll(srcTask, tgtTask);
+		var sourceKeys = srcTask.Result;
+		var targetKeys = tgtTask.Result;
 		Logger.LogDebug($"\tFetching PK set from Source: {sourceKeys.Count} rows");
-		var targetKeys = await GetPkSetAsync(tgtConnection, sql, pkColumns);
 		Logger.LogDebug($"\tFetching PK set from Target: {targetKeys.Count} rows");
 
-		var deletedKeys = sourceKeys.Except(targetKeys).ToList();
-		var addedKeys = targetKeys.Except(sourceKeys).ToList();
+		// FrozenSet で高速 Contains
+		var srcFrozen = sourceKeys.ToFrozenSet(StringComparer.Ordinal);
+		var tgtFrozen = targetKeys.ToFrozenSet(StringComparer.Ordinal);
+		var deletedKeys = new List<string>(sourceKeys.Count / 10);
+		var addedKeys = new List<string>(targetKeys.Count / 10);
+		foreach (var k in sourceKeys) { if (!tgtFrozen.Contains(k)) deletedKeys.Add(k); }
+		foreach (var k in targetKeys) { if (!srcFrozen.Contains(k)) addedKeys.Add(k); }
 		Logger.LogDebug($"\tDeleted rows[{deletedKeys.Count}] Added rows[{addedKeys.Count}] Modified rows[0]");
 
+		// Delete/Addition を並列フェッチ
 		var emptyCompareColumns = new List<string>();
-		await AddSingleSideDiffsAsync(diff, srcConnection, tableName, pkColumns, emptyCompareColumns, deletedKeys, DiffType.Delete, isSource: true);
-		await AddSingleSideDiffsAsync(diff, tgtConnection, tableName, pkColumns, emptyCompareColumns, addedKeys, DiffType.Addition, isSource: false);
+		var delTask = AddSingleSideDiffsAsync(diff, srcConnection, tableName, pkColumns, emptyCompareColumns, deletedKeys, DiffType.Delete, isSource: true);
+		var addTask = AddSingleSideDiffsAsync(diff, tgtConnection, tableName, pkColumns, emptyCompareColumns, addedKeys, DiffType.Addition, isSource: false);
+		await Task.WhenAll(delTask, addTask);
 		return diff;
 	}
 
 	private async Task<HashSet<string>> GetPkSetAsync(DbConnectionHelper dbConnection, string sql, List<string> pkColumns)
 	{
-		var keys = new HashSet<string>();
+		var keys = new HashSet<string>(StringComparer.Ordinal);
+		var sb = new StringBuilder(128);
 		using var cmd = dbConnection.CreateCommand();
 		cmd.CommandTimeout = 600;
 		using var reader = await cmd.ExecuteReaderAsync(sql);
 		while (await reader.ReadAsync())
 		{
-			var pkParts = pkColumns.Select(col =>
+			sb.Clear();
+			for (int i = 0; i < pkColumns.Count; i++)
 			{
-				var val = reader.IsDBNull(reader.GetOrdinal(col)) ? "" : reader[col]?.ToString() ?? "";
-				return $"{col}={val}";
-			});
-			keys.Add(string.Join("||", pkParts));
+				if (i > 0) sb.Append("|");
+				var col = pkColumns[i];
+				var ordinal = reader.GetOrdinal(col);
+				sb.Append(col).Append('=');
+				if (!reader.IsDBNull(ordinal))
+					sb.Append(reader[col]?.ToString() ?? "");
+			}
+			keys.Add(sb.ToString());
 		}
 		return keys;
 	}
@@ -385,27 +413,48 @@ public class MySqlVerifierService
 		var columnTypes = BuildColumnTypes(metadata);
 		var hashSql = BuildRowHashSql(tableName, pkColumns, compareColumns, tableConfig, columnTypes);
 
-		var sourceHashes = await GetRowHashesAsync(srcConnection, hashSql, pkColumns);
+		// 並列フェッチ: ソースとターゲットのハッシュを同時取得
+		var sourceHashTask = GetRowHashesAsync(srcConnection, hashSql, pkColumns);
+		var targetHashTask = GetRowHashesAsync(tgtConnection, hashSql, pkColumns);
+		await Task.WhenAll(sourceHashTask, targetHashTask);
+		var sourceHashes = sourceHashTask.Result;
+		var targetHashes = targetHashTask.Result;
 		Logger.LogDebug($"\tFetching row hashes from Source: {sourceHashes.Count} rows");
-		var targetHashes = await GetRowHashesAsync(tgtConnection, hashSql, pkColumns);
 		Logger.LogDebug($"\tFetching row hashes from Target: {targetHashes.Count} rows");
 
-		var sourceKeys = sourceHashes.Keys.ToHashSet();
-		var targetKeys = targetHashes.Keys.ToHashSet();
-		var deletedKeys = sourceKeys.Except(targetKeys).ToList();
-		var addedKeys = targetKeys.Except(sourceKeys).ToList();
-		var modifiedKeys = sourceKeys.Intersect(targetKeys).Where(k => sourceHashes[k] != targetHashes[k]).ToList();
+		// FrozenSet で高速なキー判定
+		var sourceKeySet = sourceHashes.Keys.ToFrozenSet(StringComparer.Ordinal);
+		var targetKeySet = targetHashes.Keys.ToFrozenSet(StringComparer.Ordinal);
+
+		var deletedKeys = new List<string>(sourceHashes.Count / 10);
+		var addedKeys = new List<string>(targetHashes.Count / 10);
+		var modifiedKeys = new List<string>(Math.Min(sourceHashes.Count, targetHashes.Count) / 10);
+
+		foreach (var k in sourceHashes.Keys)
+		{
+			if (!targetKeySet.Contains(k)) deletedKeys.Add(k);
+			else if (sourceHashes[k] != targetHashes[k]) modifiedKeys.Add(k);
+		}
+		foreach (var k in targetHashes.Keys)
+		{
+			if (!sourceKeySet.Contains(k)) addedKeys.Add(k);
+		}
 		Logger.LogDebug($"\tDeleted rows[{deletedKeys.Count}] Added rows[{addedKeys.Count}] Modified rows[{modifiedKeys.Count}]");
 
-		await AddSingleSideDiffsAsync(diff, srcConnection, tableName, pkColumns, compareColumns, deletedKeys, DiffType.Delete, isSource: true);
-		await AddSingleSideDiffsAsync(diff, tgtConnection, tableName, pkColumns, compareColumns, addedKeys, DiffType.Addition, isSource: false);
+		// Delete/Addition を並列フェッチ
+		var deleteTask = AddSingleSideDiffsAsync(diff, srcConnection, tableName, pkColumns, compareColumns, deletedKeys, DiffType.Delete, isSource: true);
+		var addTask = AddSingleSideDiffsAsync(diff, tgtConnection, tableName, pkColumns, compareColumns, addedKeys, DiffType.Addition, isSource: false);
+		await Task.WhenAll(deleteTask, addTask);
 
 		if (modifiedKeys.Count > 0)
 		{
-			var sourceRows = (await FetchRowsAsync(srcConnection, tableName, pkColumns, compareColumns, modifiedKeys))
-				.ToDictionary(r => GetPrimaryKeyString(r, pkColumns));
-			var targetRows = (await FetchRowsAsync(tgtConnection, tableName, pkColumns, compareColumns, modifiedKeys))
-				.ToDictionary(r => GetPrimaryKeyString(r, pkColumns));
+			// Modified 行を並列フェッチ
+			var srcRowsTask = FetchRowsAsync(srcConnection, tableName, pkColumns, compareColumns, modifiedKeys);
+			var tgtRowsTask = FetchRowsAsync(tgtConnection, tableName, pkColumns, compareColumns, modifiedKeys);
+			await Task.WhenAll(srcRowsTask, tgtRowsTask);
+
+			var sourceRows = srcRowsTask.Result.ToDictionary(r => GetPrimaryKeyString(r, pkColumns), StringComparer.Ordinal);
+			var targetRows = tgtRowsTask.Result.ToDictionary(r => GetPrimaryKeyString(r, pkColumns), StringComparer.Ordinal);
 
 			foreach (var key in modifiedKeys)
 			{
@@ -435,17 +484,34 @@ public class MySqlVerifierService
 		var columnTypes = BuildColumnTypes(metadata);
 		var hashSql = BuildGroupHashSqlIgnorePk(tableName, dateTimeKey, compareColumns, tableConfig, columnTypes);
 
-		var sourceHashes = await GetGroupHashesByDateTimeKeyAsync(srcConnection, hashSql);
+		// 並列フェッチ: ソースとターゲットのグループハッシュを同時取得
+		var srcHashTask = GetGroupHashesByDateTimeKeyAsync(srcConnection, hashSql);
+		var tgtHashTask = GetGroupHashesByDateTimeKeyAsync(tgtConnection, hashSql);
+		await Task.WhenAll(srcHashTask, tgtHashTask);
+		var sourceHashes = srcHashTask.Result;
+		var targetHashes = tgtHashTask.Result;
 		Logger.LogDebug($"\tFetching group hashes from Source (IgnorePK): {sourceHashes.Count} datetime groups");
-		var targetHashes = await GetGroupHashesByDateTimeKeyAsync(tgtConnection, hashSql);
 		Logger.LogDebug($"\tFetching group hashes from Target (IgnorePK): {targetHashes.Count} datetime groups");
 
-		var sourceKeys = sourceHashes.Keys.ToHashSet();
-		var targetKeys = targetHashes.Keys.ToHashSet();
-		var deletedKeys = sourceKeys.Except(targetKeys).ToList();
-		var addedKeys = targetKeys.Except(sourceKeys).ToList();
-		var matchedKeys = sourceKeys.Intersect(targetKeys).Where(k => sourceHashes[k] == targetHashes[k]).ToList();
-		var modifiedKeys = sourceKeys.Intersect(targetKeys).Where(k => sourceHashes[k] != targetHashes[k]).ToList();
+		// FrozenSet で高速なキー判定
+		var sourceKeySet = sourceHashes.Keys.ToFrozenSet(StringComparer.Ordinal);
+		var targetKeySet = targetHashes.Keys.ToFrozenSet(StringComparer.Ordinal);
+
+		var deletedKeys = new List<string>(sourceHashes.Count / 10);
+		var addedKeys = new List<string>(targetHashes.Count / 10);
+		var matchedKeys = new List<string>(Math.Min(sourceHashes.Count, targetHashes.Count));
+		var modifiedKeys = new List<string>(Math.Min(sourceHashes.Count, targetHashes.Count) / 10);
+
+		foreach (var k in sourceHashes.Keys)
+		{
+			if (!targetKeySet.Contains(k)) deletedKeys.Add(k);
+			else if (sourceHashes[k] == targetHashes[k]) matchedKeys.Add(k);
+			else modifiedKeys.Add(k);
+		}
+		foreach (var k in targetHashes.Keys)
+		{
+			if (!sourceKeySet.Contains(k)) addedKeys.Add(k);
+		}
 		Logger.LogDebug($"\tDeleted groups[{deletedKeys.Count}] Added groups[{addedKeys.Count}] Matched groups[{matchedKeys.Count}] Modified groups[{modifiedKeys.Count}]");
 
 		var nonPkCompareColumns = compareColumns
@@ -454,20 +520,26 @@ public class MySqlVerifierService
 		if (!fetchColumns.Contains(dateTimeKey, StringComparer.OrdinalIgnoreCase))
 			fetchColumns.Add(dateTimeKey);
 
-		var srcOnlyRows = deletedKeys.Count > 0
-			? await FetchRowsByDateTimeKeyAsync(srcConnection, tableName, fetchColumns, dateTimeKey, deletedKeys)
-			: new List<Dictionary<string, object?>>();
-		var tgtOnlyRows = addedKeys.Count > 0
-			? await FetchRowsByDateTimeKeyAsync(tgtConnection, tableName, fetchColumns, dateTimeKey, addedKeys)
-			: new List<Dictionary<string, object?>>();
+		// deleted/added/modified の行を並列フェッチ
+		var srcDeletedTask = deletedKeys.Count > 0
+			? FetchRowsByDateTimeKeyAsync(srcConnection, tableName, fetchColumns, dateTimeKey, deletedKeys)
+			: Task.FromResult(new List<Dictionary<string, object?>>());
+		var tgtAddedTask = addedKeys.Count > 0
+			? FetchRowsByDateTimeKeyAsync(tgtConnection, tableName, fetchColumns, dateTimeKey, addedKeys)
+			: Task.FromResult(new List<Dictionary<string, object?>>());
+		await Task.WhenAll(srcDeletedTask, tgtAddedTask);
+		var srcOnlyRows = srcDeletedTask.Result;
+		var tgtOnlyRows = tgtAddedTask.Result;
 
 		// グループ内比較（余りは srcOnlyRows / tgtOnlyRows に集約）
 		if (modifiedKeys.Count > 0)
 		{
-			var sourceRows = await FetchRowsByDateTimeKeyAsync(srcConnection, tableName, fetchColumns, dateTimeKey, modifiedKeys);
-			var targetRows = await FetchRowsByDateTimeKeyAsync(tgtConnection, tableName, fetchColumns, dateTimeKey, modifiedKeys);
-			var srcGroups = GroupRowsByDateTimeKey(sourceRows, dateTimeKey);
-			var tgtGroups = GroupRowsByDateTimeKey(targetRows, dateTimeKey);
+			// modified グループのソース/ターゲット行を並列フェッチ
+			var srcModTask = FetchRowsByDateTimeKeyAsync(srcConnection, tableName, fetchColumns, dateTimeKey, modifiedKeys);
+			var tgtModTask = FetchRowsByDateTimeKeyAsync(tgtConnection, tableName, fetchColumns, dateTimeKey, modifiedKeys);
+			await Task.WhenAll(srcModTask, tgtModTask);
+			var srcGroups = GroupRowsByDateTimeKey(srcModTask.Result, dateTimeKey);
+			var tgtGroups = GroupRowsByDateTimeKey(tgtModTask.Result, dateTimeKey);
 
 			foreach (var key in modifiedKeys)
 			{
@@ -492,20 +564,34 @@ public class MySqlVerifierService
 		// Modify ペアを生成する。残りは Delete/Addition として報告する。
 		if ((finalTgtOnly.Count > 0 || finalSrcOnly.Count > 0) && matchedKeys.Count > 0)
 		{
-			var matchedSrcRows = finalTgtOnly.Count > 0
-				? await FetchRowsByDateTimeKeyAsync(srcConnection, tableName, fetchColumns, dateTimeKey, matchedKeys)
-				: new List<Dictionary<string, object?>>();
-			var matchedTgtRows = finalSrcOnly.Count > 0
-				? await FetchRowsByDateTimeKeyAsync(tgtConnection, tableName, fetchColumns, dateTimeKey, matchedKeys)
-				: new List<Dictionary<string, object?>>();
+			// matched グループの行を並列フェッチ
+			var matchedSrcTask = finalTgtOnly.Count > 0
+				? FetchRowsByDateTimeKeyAsync(srcConnection, tableName, fetchColumns, dateTimeKey, matchedKeys)
+				: Task.FromResult(new List<Dictionary<string, object?>>());
+			var matchedTgtTask = finalSrcOnly.Count > 0
+				? FetchRowsByDateTimeKeyAsync(tgtConnection, tableName, fetchColumns, dateTimeKey, matchedKeys)
+				: Task.FromResult(new List<Dictionary<string, object?>>());
+			await Task.WhenAll(matchedSrcTask, matchedTgtTask);
+			var matchedSrcRows = matchedSrcTask.Result;
+			var matchedTgtRows = matchedTgtTask.Result;
 
+			// AlternativeKey 生成用の FrozenSet で高速 Contains チェック
+			var altKeySet = alternativeKey.ToFrozenSet(StringComparer.OrdinalIgnoreCase);
 			string AltKey(Dictionary<string, object?> row)
-				=> string.Join("|", alternativeKey.Select(c => FormatColumnValue(row.GetValueOrDefault(c))));
+			{
+				var sb = new StringBuilder(64);
+				for (int i = 0; i < alternativeKey.Count; i++)
+				{
+					if (i > 0) sb.Append('|');
+					sb.Append(FormatColumnValue(row.GetValueOrDefault(alternativeKey[i])));
+				}
+				return sb.ToString();
+			}
 
 			// Addition 候補の再照合: ハッシュ一致グループのソース行と AlternativeKey マッチ → Modify
 			if (finalTgtOnly.Count > 0 && matchedSrcRows.Count > 0)
 			{
-				var matchedSrcByAltKey = new Dictionary<string, List<Dictionary<string, object?>>>();
+				var matchedSrcByAltKey = new Dictionary<string, List<Dictionary<string, object?>>>(matchedSrcRows.Count, StringComparer.Ordinal);
 				foreach (var row in matchedSrcRows)
 					AddToList(matchedSrcByAltKey, AltKey(row), row);
 
@@ -542,9 +628,9 @@ public class MySqlVerifierService
 			// Delete 候補の再照合: ハッシュ一致グループのターゲット行と AlternativeKey マッチ → Modify
 			if (finalSrcOnly.Count > 0 && matchedTgtRows.Count > 0)
 			{
-				var matchedTgtByAltKey = new Dictionary<string, List<Dictionary<string, object?>>>();
-				foreach (var row in matchedTgtRows)
-					AddToList(matchedTgtByAltKey, AltKey(row), row);
+					var matchedTgtByAltKey = new Dictionary<string, List<Dictionary<string, object?>>>(matchedTgtRows.Count, StringComparer.Ordinal);
+					foreach (var row in matchedTgtRows)
+						AddToList(matchedTgtByAltKey, AltKey(row), row);
 
 				var resolved = new HashSet<int>();
 				for (int i = 0; i < finalSrcOnly.Count; i++)
@@ -598,47 +684,80 @@ public class MySqlVerifierService
 		List<Dictionary<string, object?>>? unmatchedSrcOut = null,
 		List<Dictionary<string, object?>>? unmatchedTgtOut = null)
 	{
+		// StringBuilder ベースのキー生成（LINQ + string.Join の GC 圧を回避）
+		var keySb = new StringBuilder(256);
+
 		string RowContentKey(Dictionary<string, object?> row)
-			=> string.Join("|", nonPkCompareColumns.Select(c => FormatColumnValue(row.GetValueOrDefault(c))));
+		{
+			keySb.Clear();
+			for (int i = 0; i < nonPkCompareColumns.Count; i++)
+			{
+				if (i > 0) keySb.Append('|');
+				keySb.Append(FormatColumnValue(row.GetValueOrDefault(nonPkCompareColumns[i])));
+			}
+			return keySb.ToString();
+		}
 
 		string AltKey(Dictionary<string, object?> row)
-			=> string.Join("|", alternativeKey.Select(c => FormatColumnValue(row.GetValueOrDefault(c))));
+		{
+			keySb.Clear();
+			for (int i = 0; i < alternativeKey.Count; i++)
+			{
+				if (i > 0) keySb.Append('|');
+				keySb.Append(FormatColumnValue(row.GetValueOrDefault(alternativeKey[i])));
+			}
+			return keySb.ToString();
+		}
 
-		// Step 1: 完全一致行を消し込み
-		var srcBag = new Dictionary<string, List<Dictionary<string, object?>>>();
+		// Step 1: 完全一致行を消し込み（容量を事前推定）
+		var srcBag = new Dictionary<string, List<Dictionary<string, object?>>>(srcGroup.Count, StringComparer.Ordinal);
 		foreach (var row in srcGroup) AddToList(srcBag, RowContentKey(row), row);
 
-		var tgtBag = new Dictionary<string, List<Dictionary<string, object?>>>();
+		var tgtBag = new Dictionary<string, List<Dictionary<string, object?>>>(tgtGroup.Count, StringComparer.Ordinal);
 		foreach (var row in tgtGroup) AddToList(tgtBag, RowContentKey(row), row);
 
 		var unmatchedSrc = new List<Dictionary<string, object?>>();
 		var unmatchedTgt = new List<Dictionary<string, object?>>();
 
-		foreach (var contentKey in srcBag.Keys.Union(tgtBag.Keys))
+		// srcBag のキーを走査し、tgtBag とマッチングを行う（Union の代わりに直接走査）
+		foreach (var kvp in srcBag)
 		{
-			var srcRows = srcBag.GetValueOrDefault(contentKey) ?? new List<Dictionary<string, object?>>();
-			var tgtRows = tgtBag.GetValueOrDefault(contentKey) ?? new List<Dictionary<string, object?>>();
-			var matchCount = Math.Min(srcRows.Count, tgtRows.Count);
-			for (int i = matchCount; i < srcRows.Count; i++) unmatchedSrc.Add(srcRows[i]);
-			for (int i = matchCount; i < tgtRows.Count; i++) unmatchedTgt.Add(tgtRows[i]);
+			var srcRows = kvp.Value;
+			if (tgtBag.TryGetValue(kvp.Key, out var tgtRows))
+			{
+				var matchCount = Math.Min(srcRows.Count, tgtRows.Count);
+				for (int i = matchCount; i < srcRows.Count; i++) unmatchedSrc.Add(srcRows[i]);
+				for (int i = matchCount; i < tgtRows.Count; i++) unmatchedTgt.Add(tgtRows[i]);
+			}
+			else
+			{
+				unmatchedSrc.AddRange(srcRows);
+			}
+		}
+		// tgtBag にのみ存在するキーの行を追加
+		foreach (var kvp in tgtBag)
+		{
+			if (!srcBag.ContainsKey(kvp.Key))
+				unmatchedTgt.AddRange(kvp.Value);
 		}
 
-		// Step 2: AlternativeKey マッチ → Modify
-		var srcByAltKey = new Dictionary<string, List<int>>();
+		// Step 2: AlternativeKey マッチ → Modify（容量を事前推定）
+		var srcByAltKey = new Dictionary<string, List<int>>(unmatchedSrc.Count, StringComparer.Ordinal);
 		for (int i = 0; i < unmatchedSrc.Count; i++)
 			AddToList(srcByAltKey, AltKey(unmatchedSrc[i]), i);
 
-		var tgtByAltKey = new Dictionary<string, List<int>>();
+		var tgtByAltKey = new Dictionary<string, List<int>>(unmatchedTgt.Count, StringComparer.Ordinal);
 		for (int i = 0; i < unmatchedTgt.Count; i++)
 			AddToList(tgtByAltKey, AltKey(unmatchedTgt[i]), i);
 
-		var pairedSrc = new HashSet<int>();
-		var pairedTgt = new HashSet<int>();
+		var pairedSrc = new HashSet<int>(unmatchedSrc.Count);
+		var pairedTgt = new HashSet<int>(unmatchedTgt.Count);
 
-		foreach (var key in srcByAltKey.Keys.Intersect(tgtByAltKey.Keys))
+		// Dictionary の直接走査で Intersect を回避
+		foreach (var kvp in srcByAltKey)
 		{
-			var srcIndices = srcByAltKey[key];
-			var tgtIndices = tgtByAltKey[key];
+			if (!tgtByAltKey.TryGetValue(kvp.Key, out var tgtIndices)) continue;
+			var srcIndices = kvp.Value;
 			var pairCount = Math.Min(srcIndices.Count, tgtIndices.Count);
 			for (int i = 0; i < pairCount; i++)
 			{
@@ -661,7 +780,7 @@ public class MySqlVerifierService
 	private static Dictionary<string, List<Dictionary<string, object?>>> GroupRowsByDateTimeKey(
 		List<Dictionary<string, object?>> rows, string dateTimeKey)
 	{
-		var groups = new Dictionary<string, List<Dictionary<string, object?>>>();
+		var groups = new Dictionary<string, List<Dictionary<string, object?>>>(rows.Count / 4 + 1, StringComparer.Ordinal);
 		foreach (var row in rows)
 			AddToList(groups, FormatColumnValue(row.GetValueOrDefault(dateTimeKey)), row);
 		return groups;
@@ -712,7 +831,7 @@ public class MySqlVerifierService
 		DbConnectionHelper dbConnection, string tableName, List<string> selectColumns,
 		string dateTimeKey, List<string> dateTimeKeys)
 	{
-		var rows = new List<Dictionary<string, object?>>();
+		var rows = new List<Dictionary<string, object?>>(dateTimeKeys.Count * 4); // 容量を事前推定
 		if (dateTimeKeys.Count == 0) return rows;
 		var selectCols = string.Join(", ", selectColumns.Select(c => $"`{c}`"));
 
@@ -763,27 +882,46 @@ public class MySqlVerifierService
 		var orderBy = string.Join(", ", allColumns.Select(c => $"{prefix}`{c}`"));
 		var fetchSql = $"SELECT {selectCols} FROM {fromClause}{joinClause}{whereClause} ORDER BY {orderBy}";
 
-		Logger.LogDebug($"\tFetching all rows from Source...");
-		var sourceRows = await FetchAllRowsAsync(srcConnection, fetchSql);
-		Logger.LogDebug($"\tFetched {sourceRows.Count} rows from Source");
-		Logger.LogDebug($"\tFetching all rows from Target...");
-		var targetRows = await FetchAllRowsAsync(tgtConnection, fetchSql);
-		Logger.LogDebug($"\tFetched {targetRows.Count} rows from Target");
+		// 並列フェッチ: ソースとターゲットの全行を同時取得
+		Logger.LogDebug($"\tFetching all rows from Source and Target...");
+		var srcFetchTask = FetchAllRowsAsync(srcConnection, fetchSql);
+		var tgtFetchTask = FetchAllRowsAsync(tgtConnection, fetchSql);
+		await Task.WhenAll(srcFetchTask, tgtFetchTask);
+		var sourceRows = srcFetchTask.Result;
+		var targetRows = tgtFetchTask.Result;
+		Logger.LogDebug($"\tFetched {sourceRows.Count} rows from Source, {targetRows.Count} rows from Target");
 
 		var sourceMultiset = BuildRowMultiset(sourceRows, allColumns);
 		var targetMultiset = BuildRowMultiset(targetRows, allColumns);
 
-		foreach (var sig in sourceMultiset.Keys.Union(targetMultiset.Keys))
+		var emptyPkList = new List<string>();
+		// 直接走査で Union を回避
+		foreach (var kvp in sourceMultiset)
 		{
-			var srcList = sourceMultiset.GetValueOrDefault(sig, new List<Dictionary<string, object?>>());
-			var tgtList = targetMultiset.GetValueOrDefault(sig, new List<Dictionary<string, object?>>());
-			for (int i = tgtList.Count; i < srcList.Count; i++)
-				diff.AddEntry(DiffType.Delete, new List<string>(), srcList[i], null, allColumns);
-			for (int i = srcList.Count; i < tgtList.Count; i++)
-				diff.AddEntry(DiffType.Addition, new List<string>(), null, tgtList[i], allColumns);
+			var srcList = kvp.Value;
+			if (targetMultiset.TryGetValue(kvp.Key, out var tgtList))
+			{
+				for (int i = tgtList.Count; i < srcList.Count; i++)
+					diff.AddEntry(DiffType.Delete, emptyPkList, srcList[i], null, allColumns);
+				for (int i = srcList.Count; i < tgtList.Count; i++)
+					diff.AddEntry(DiffType.Addition, emptyPkList, null, tgtList[i], allColumns);
+			}
+			else
+			{
+				foreach (var row in srcList)
+					diff.AddEntry(DiffType.Delete, emptyPkList, row, null, allColumns);
+			}
+		}
+		foreach (var kvp in targetMultiset)
+		{
+			if (!sourceMultiset.ContainsKey(kvp.Key))
+				foreach (var row in kvp.Value)
+					diff.AddEntry(DiffType.Addition, emptyPkList, null, row, allColumns);
 		}
 
-		Logger.LogDebug($"\tDeleted rows[{diff.Entries.Count(e => e.DiffType == DiffType.Delete)}] Added rows[{diff.Entries.Count(e => e.DiffType == DiffType.Addition)}]");
+		var delCount = diff.Entries.Count(e => e.DiffType == DiffType.Delete);
+		var addCount = diff.Entries.Count(e => e.DiffType == DiffType.Addition);
+		Logger.LogDebug($"\tDeleted rows[{delCount}] Added rows[{addCount}]");
 		return diff;
 	}
 
@@ -809,9 +947,18 @@ public class MySqlVerifierService
 	private static Dictionary<string, List<Dictionary<string, object?>>> BuildRowMultiset(
 		List<Dictionary<string, object?>> rows, List<string> allColumns)
 	{
-		var multiset = new Dictionary<string, List<Dictionary<string, object?>>>();
+		var multiset = new Dictionary<string, List<Dictionary<string, object?>>>(rows.Count, StringComparer.Ordinal);
+		var sb = new StringBuilder(256);
 		foreach (var row in rows)
-			AddToList(multiset, string.Join("||", allColumns.Select(c => RowDiff.FormatCsvValue(row.GetValueOrDefault(c)))), row);
+		{
+			sb.Clear();
+			for (int i = 0; i < allColumns.Count; i++)
+			{
+				if (i > 0) sb.Append("|");
+				sb.Append(RowDiff.FormatCsvValue(row.GetValueOrDefault(allColumns[i])));
+			}
+			AddToList(multiset, sb.ToString(), row);
+		}
 		return multiset;
 	}
 
@@ -876,19 +1023,25 @@ public class MySqlVerifierService
 	private async Task<Dictionary<string, uint>> GetRowHashesAsync(
 		DbConnectionHelper dbConnection, string sql, List<string> pkColumns)
 	{
-		var hashes = new Dictionary<string, uint>();
+		var hashes = new Dictionary<string, uint>(StringComparer.Ordinal);
+		var sb = new StringBuilder(128);
 		using var cmd = dbConnection.CreateCommand();
 		cmd.CommandTimeout = 600;
 		using var reader = await cmd.ExecuteReaderAsync(sql);
 		while (await reader.ReadAsync())
 		{
-			var key = string.Join("||", pkColumns.Select(col =>
+			sb.Clear();
+			for (int i = 0; i < pkColumns.Count; i++)
 			{
-				var val = reader.IsDBNull(reader.GetOrdinal(col)) ? "" : reader[col]?.ToString() ?? "";
-				return $"{col}={val}";
-			}));
+				if (i > 0) sb.Append("|");
+				var col = pkColumns[i];
+				var ordinal = reader.GetOrdinal(col);
+				sb.Append(col).Append('=');
+				if (!reader.IsDBNull(ordinal))
+					sb.Append(reader[col]?.ToString() ?? "");
+			}
 			var hashOrdinal = reader.GetOrdinal("row_hash");
-			hashes[key] = reader.IsDBNull(hashOrdinal) ? 0u : Convert.ToUInt32(reader[hashOrdinal]);
+			hashes[sb.ToString()] = reader.IsDBNull(hashOrdinal) ? 0u : Convert.ToUInt32(reader[hashOrdinal]);
 		}
 		return hashes;
 	}
@@ -897,7 +1050,7 @@ public class MySqlVerifierService
 		DbConnectionHelper dbConnection, string tableName,
 		List<string> pkColumns, List<string> dataColumns, List<string> pkKeys)
 	{
-		var rows = new List<Dictionary<string, object?>>();
+		var rows = new List<Dictionary<string, object?>>(pkKeys.Count); // 容量を事前推定
 		if (pkKeys.Count == 0) return rows;
 
 		var allColumns = pkColumns.Concat(dataColumns).Distinct().ToList();
@@ -944,7 +1097,15 @@ public class MySqlVerifierService
 	}
 
 	private static string GetPrimaryKeyString(Dictionary<string, object?> row, List<string> pkColumns)
-		=> string.Join("||", pkColumns.Select(c => $"{c}={row.GetValueOrDefault(c)?.ToString() ?? ""}"));
+	{
+		var sb = new StringBuilder(64);
+		for (int i = 0; i < pkColumns.Count; i++)
+		{
+			if (i > 0) sb.Append('|');
+			sb.Append(pkColumns[i]).Append('=').Append(row.GetValueOrDefault(pkColumns[i])?.ToString() ?? "");
+		}
+		return sb.ToString();
+	}
 
 	private async Task WriteDiffCsvAsync(
 		string tableName,
