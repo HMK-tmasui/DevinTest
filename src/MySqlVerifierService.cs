@@ -169,6 +169,7 @@ public class MySqlVerifierService
 
 					var pkColumns = sourceMetadata.GetPrimaryKeyNames();
 				var hasPrimaryKey = sourceMetadata.PrimaryKeys.Count > 0;
+				var originalDbPkColumns = pkColumns.ToList(); // 元のDB PKを保持
 
 				// force_pk: 指定されたカラムを PK として強制的に扱う
 				if (tableConfig?.ForcePK != null && tableConfig.ForcePK.Count > 0)
@@ -222,7 +223,7 @@ public class MySqlVerifierService
 					// IgnorePK モード: ModifiedKey で行をマッチし、PK以外のカラムのハッシュで比較
 					Logger.LogInfo($"  Table '{tableName}' using IgnorePrimaryKey mode (DateTimeKey='{tableConfig!.ModifiedKey}')");
 					diff = await CompareTableDataIgnorePkAsync(
-						tableName, srcConnection, tgtConnection, pkColumns, compareColumns, tableConfig, sourceMetadata, tableConfig!.AlternativeKey);
+						tableName, srcConnection, tgtConnection, pkColumns, compareColumns, tableConfig, sourceMetadata, tableConfig!.AlternativeKey, originalDbPkColumns);
 				}
 				else if (hasPrimaryKey && compareColumns.Count == 0)
 				{
@@ -475,8 +476,13 @@ public class MySqlVerifierService
 	private async Task<MySqlVerifierDiff> CompareTableDataIgnorePkAsync(
 		string tableName, DbConnectionHelper srcConnection, DbConnectionHelper tgtConnection,
 		List<string> pkColumns, List<string> compareColumns,
-		IncludeTableConfig tableConfig, MySqlVerifierMetadata metadata, List<string> alternativeKey)
+		IncludeTableConfig tableConfig, MySqlVerifierMetadata metadata, List<string> alternativeKey,
+		List<string>? originalDbPkColumns = null)
 	{
+		// force_pk 使用時: SetPkToIgnore には元のDB PKを使用（force_pk カラムは実際の値を保持）
+		var ignorePkColumns = (originalDbPkColumns != null && originalDbPkColumns.Count > 0
+			&& !pkColumns.SequenceEqual(originalDbPkColumns, StringComparer.OrdinalIgnoreCase))
+			? originalDbPkColumns : pkColumns;
 		var dateTimeKey = tableConfig.ModifiedKey;
 		var allColumns = pkColumns.Concat(compareColumns).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
 		var diff = new MySqlVerifierDiff();
@@ -547,7 +553,7 @@ public class MySqlVerifierService
 				var srcGroup = srcGroups.GetValueOrDefault(key) ?? new List<Dictionary<string, object?>>();
 				var tgtGroup = tgtGroups.GetValueOrDefault(key) ?? new List<Dictionary<string, object?>>();
 				CompareRowSets(diff, pkColumns, nonPkCompareColumns, alternativeKey, srcGroup, tgtGroup,
-					unmatchedSrcOut: srcOnlyRows, unmatchedTgtOut: tgtOnlyRows);
+					unmatchedSrcOut: srcOnlyRows, unmatchedTgtOut: tgtOnlyRows, ignorePkColumns: ignorePkColumns);
 			}
 		}
 
@@ -556,7 +562,7 @@ public class MySqlVerifierService
 		var finalTgtOnly = new List<Dictionary<string, object?>>();
 		if (srcOnlyRows.Count > 0 || tgtOnlyRows.Count > 0)
 			CompareRowSets(diff, pkColumns, nonPkCompareColumns, alternativeKey, srcOnlyRows, tgtOnlyRows,
-				unmatchedSrcOut: finalSrcOnly, unmatchedTgtOut: finalTgtOnly);
+				unmatchedSrcOut: finalSrcOnly, unmatchedTgtOut: finalTgtOnly, ignorePkColumns: ignorePkColumns);
 
 		// ── ハッシュ一致グループの行を使った再照合 ──
 		// 横断比較後に残った余り行は、ハッシュ一致で完全スキップされた
@@ -602,9 +608,9 @@ public class MySqlVerifierService
 					{
 						var srcRow = srcCandidates[0];
 						srcCandidates.RemoveAt(0);
-						diff.AddEntry(DiffType.Modify, pkColumns,
-							SetPkToIgnore(srcRow, pkColumns),
-							SetPkToIgnore(finalTgtOnly[i], pkColumns), nonPkCompareColumns);
+							diff.AddEntry(DiffType.Modify, pkColumns,
+							SetPkToIgnore(srcRow, ignorePkColumns),
+							SetPkToIgnore(finalTgtOnly[i], ignorePkColumns), nonPkCompareColumns);
 						resolved.Add(i);
 					}
 				}
@@ -613,7 +619,7 @@ public class MySqlVerifierService
 				{
 					if (!resolved.Contains(i))
 						diff.AddEntry(DiffType.Addition, pkColumns, null,
-							SetPkToIgnore(finalTgtOnly[i], pkColumns), nonPkCompareColumns);
+							SetPkToIgnore(finalTgtOnly[i], ignorePkColumns), nonPkCompareColumns);
 				}
 			}
 			else
@@ -621,7 +627,7 @@ public class MySqlVerifierService
 				// ハッシュ一致グループなし or Addition 候補なし → そのまま Addition
 				foreach (var row in finalTgtOnly)
 					diff.AddEntry(DiffType.Addition, pkColumns, null,
-						SetPkToIgnore(row, pkColumns), nonPkCompareColumns);
+						SetPkToIgnore(row, ignorePkColumns), nonPkCompareColumns);
 			}
 
 			// Delete 候補の再照合: ハッシュ一致グループのターゲット行と AlternativeKey マッチ → Modify
@@ -640,8 +646,8 @@ public class MySqlVerifierService
 						var tgtRow = tgtCandidates[0];
 						tgtCandidates.RemoveAt(0);
 						diff.AddEntry(DiffType.Modify, pkColumns,
-							SetPkToIgnore(finalSrcOnly[i], pkColumns),
-							SetPkToIgnore(tgtRow, pkColumns), nonPkCompareColumns);
+							SetPkToIgnore(finalSrcOnly[i], ignorePkColumns),
+							SetPkToIgnore(tgtRow, ignorePkColumns), nonPkCompareColumns);
 						resolved.Add(i);
 					}
 				}
@@ -650,7 +656,7 @@ public class MySqlVerifierService
 				{
 					if (!resolved.Contains(i))
 						diff.AddEntry(DiffType.Delete, pkColumns,
-							SetPkToIgnore(finalSrcOnly[i], pkColumns), null, nonPkCompareColumns);
+							SetPkToIgnore(finalSrcOnly[i], ignorePkColumns), null, nonPkCompareColumns);
 				}
 			}
 			else
@@ -658,7 +664,7 @@ public class MySqlVerifierService
 				// ハッシュ一致グループなし or Delete 候補なし → そのまま Delete
 				foreach (var row in finalSrcOnly)
 					diff.AddEntry(DiffType.Delete, pkColumns,
-						SetPkToIgnore(row, pkColumns), null, nonPkCompareColumns);
+						SetPkToIgnore(row, ignorePkColumns), null, nonPkCompareColumns);
 			}
 		}
 		else
@@ -666,10 +672,10 @@ public class MySqlVerifierService
 			// ハッシュ一致グループがない場合、余りをそのまま報告
 			foreach (var row in finalTgtOnly)
 				diff.AddEntry(DiffType.Addition, pkColumns, null,
-					SetPkToIgnore(row, pkColumns), nonPkCompareColumns);
+					SetPkToIgnore(row, ignorePkColumns), nonPkCompareColumns);
 			foreach (var row in finalSrcOnly)
 				diff.AddEntry(DiffType.Delete, pkColumns,
-					SetPkToIgnore(row, pkColumns), null, nonPkCompareColumns);
+					SetPkToIgnore(row, ignorePkColumns), null, nonPkCompareColumns);
 		}
 
 		return diff;
@@ -681,8 +687,11 @@ public class MySqlVerifierService
 		List<string> alternativeKey,
 		List<Dictionary<string, object?>> srcGroup, List<Dictionary<string, object?>> tgtGroup,
 		List<Dictionary<string, object?>>? unmatchedSrcOut = null,
-		List<Dictionary<string, object?>>? unmatchedTgtOut = null)
+		List<Dictionary<string, object?>>? unmatchedTgtOut = null,
+		List<string>? ignorePkColumns = null)
 	{
+		// ignorePkColumns が指定されていない場合は pkColumns を使用（従来動作）
+		var setPkIgnoreCols = ignorePkColumns ?? pkColumns;
 		// StringBuilder ベースのキー生成（LINQ + string.Join の GC 圧を回避）
 		var keySb = new StringBuilder(256);
 
@@ -763,16 +772,16 @@ public class MySqlVerifierService
 				pairedSrc.Add(srcIndices[i]);
 				pairedTgt.Add(tgtIndices[i]);
 				diff.AddEntry(DiffType.Modify, pkColumns,
-					SetPkToIgnore(unmatchedSrc[srcIndices[i]], pkColumns),
-					SetPkToIgnore(unmatchedTgt[tgtIndices[i]], pkColumns), nonPkCompareColumns);
+					SetPkToIgnore(unmatchedSrc[srcIndices[i]], setPkIgnoreCols),
+					SetPkToIgnore(unmatchedTgt[tgtIndices[i]], setPkIgnoreCols), nonPkCompareColumns);
 			}
 		}
 
 		// Step 3: 余りを集約 or 直接報告
 		ReportOrCollectUnmatched(unmatchedSrc, pairedSrc, unmatchedSrcOut, row =>
-			diff.AddEntry(DiffType.Delete, pkColumns, SetPkToIgnore(row, pkColumns), null, nonPkCompareColumns));
+			diff.AddEntry(DiffType.Delete, pkColumns, SetPkToIgnore(row, setPkIgnoreCols), null, nonPkCompareColumns));
 		ReportOrCollectUnmatched(unmatchedTgt, pairedTgt, unmatchedTgtOut, row =>
-			diff.AddEntry(DiffType.Addition, pkColumns, null, SetPkToIgnore(row, pkColumns), nonPkCompareColumns));
+			diff.AddEntry(DiffType.Addition, pkColumns, null, SetPkToIgnore(row, setPkIgnoreCols), nonPkCompareColumns));
 	}
 
 
