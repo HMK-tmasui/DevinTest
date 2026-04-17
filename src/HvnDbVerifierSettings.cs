@@ -58,13 +58,18 @@ public class IncludeTableConfig
 	[JsonProperty("reference_table")]
 	public ReferenceTableConfig? ReferenceTable { get; set; }
 
-	//IDが衝突するケースがあり、主キーを無視して比較するオプションを追加
-	[JsonProperty("ignore_primary_key")]
-	public bool IgnorePrimaryKey { get; set; } = false;
+	[JsonProperty("force_pk")]
+	public List<string> ForcePK { get; set; } = [];
 
+	//IDが衝突するケースがあり、主キーを無視して比較するオプションを追加
+	[JsonProperty("ignore_pk")]
+	public bool IgnorePK { get; set; } = false;
+
+	//変更と判断するカラム
 	[JsonProperty("modified_key")]
 	public string ModifiedKey { get; set; } = "";
 
+	//不変と判断するカラム　このカラムが変更されていた場合、Delete/Additionペアか記録される
 	[JsonProperty("alternative_key")]
 	public List<string> AlternativeKey { get; set; } = [];
 }

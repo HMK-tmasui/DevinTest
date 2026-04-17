@@ -167,8 +167,16 @@ public class MySqlVerifierService
 				// include_tables 設定を取得
 				_includeTableConfigs.TryGetValue(tableName, out var tableConfig);
 
-				var pkColumns = sourceMetadata.GetPrimaryKeyNames();
+					var pkColumns = sourceMetadata.GetPrimaryKeyNames();
 				var hasPrimaryKey = sourceMetadata.PrimaryKeys.Count > 0;
+
+				// force_pk: 指定されたカラムを PK として強制的に扱う
+				if (tableConfig?.ForcePK != null && tableConfig.ForcePK.Count > 0)
+				{
+					pkColumns = tableConfig.ForcePK.ToList();
+					hasPrimaryKey = true;
+					Logger.LogInfo($"  Table '{tableName}' using force_pk: [{string.Join(", ", pkColumns)}]");
+				}
 
 				if (!hasPrimaryKey)
 					Logger.LogInfo($"  Table '{tableName}' has no primary key, using full-row comparison");
@@ -195,8 +203,8 @@ public class MySqlVerifierService
 					csvColumns = pkColumns.Concat(compareColumns).Distinct().ToList();
 				}
 
-				// IgnorePrimaryKey モード判定
-				var ignorePk = tableConfig?.IgnorePrimaryKey == true;
+				// IgnorePK モード判定
+				var ignorePk = tableConfig?.IgnorePK == true;
 				if (ignorePk && string.IsNullOrWhiteSpace(tableConfig?.ModifiedKey))
 				{
 					Logger.LogWarning($"  Table '{tableName}' has IgnorePrimaryKey=true but DateTimeKey is not set. Skipping.");
@@ -211,7 +219,7 @@ public class MySqlVerifierService
 				MySqlVerifierDiff diff;
 				if (ignorePk)
 				{
-					// IgnorePrimaryKey モード: ModifiedKey で行をマッチし、PK以外のカラムのハッシュで比較
+					// IgnorePK モード: ModifiedKey で行をマッチし、PK以外のカラムのハッシュで比較
 					Logger.LogInfo($"  Table '{tableName}' using IgnorePrimaryKey mode (DateTimeKey='{tableConfig!.ModifiedKey}')");
 					diff = await CompareTableDataIgnorePkAsync(
 						tableName, srcConnection, tgtConnection, pkColumns, compareColumns, tableConfig, sourceMetadata, tableConfig!.AlternativeKey);
@@ -459,7 +467,7 @@ public class MySqlVerifierService
 	}
 
 	/// <summary>
-	/// IgnorePrimaryKey モード: ModifiedKey で行をマッチし、PK を除いた値のハッシュで比較。
+	/// IgnorePK モード: ModifiedKey で行をマッチし、PK を除いた値のハッシュで比較。
 	/// グループ内余りは横断比較で直接 Modify / Delete / Addition を確定する。
 	/// ハッシュ一致グループの行も AlternativeKey 照合用に保持し、
 	/// 横断比較後に残った Addition/Delete を再照合して Modify を検出する。

@@ -31,7 +31,7 @@ public class CompareTableDataIgnorePkTests
     {
         Name = TableName,
         Columns = ConfigColumns,
-        IgnorePrimaryKey = true,
+        IgnorePK = true,
         ModifiedKey = "latest_update",
         AlternativeKey = new List<string> { "jvndb_id", "name", "url" }
     };
@@ -387,6 +387,204 @@ public class CompareTableDataIgnorePkTests
         Assert.Empty(additions);
         Assert.Single(modifies);
         Assert.Empty(deletes);
+    }
+
+    /// <summary>
+    /// force_pk テスト: force_pk で指定したカラムが PK として扱われ、
+    /// 通常の PK ベース比較が force_pk カラムで行われることを検証。
+    /// </summary>
+    [Fact]
+    public async Task ForcePk_ShouldTreatSpecifiedColumnsAsPk()
+    {
+        // hvn テーブル相当: 実際の PK は hvn_id だが、force_pk で jvndb_id を PK 扱い
+        var columns = new List<ColumnInfo>
+        {
+            new() { ColumnName = "hvn_id", DataType = "int", ColumnType = "int(11)", IsPrimaryKey = true },
+            new() { ColumnName = "jvndb_id", DataType = "varchar", ColumnType = "varchar(255)" },
+            new() { ColumnName = "nvd_id", DataType = "varchar", ColumnType = "varchar(255)" },
+            new() { ColumnName = "is_update", DataType = "tinyint", ColumnType = "tinyint(1)" },
+            new() { ColumnName = "is_reject", DataType = "tinyint", ColumnType = "tinyint(1)" },
+            new() { ColumnName = "published_date", DataType = "datetime", ColumnType = "datetime" },
+            new() { ColumnName = "last_modified_date", DataType = "datetime", ColumnType = "datetime" },
+            new() { ColumnName = "create_date", DataType = "datetime", ColumnType = "datetime" }
+        };
+        var primaryKeys = columns.Where(c => c.IsPrimaryKey).ToList();
+
+        var dt1 = new DateTime(2026, 1, 1, 0, 0, 0);
+        var dt2 = new DateTime(2026, 2, 1, 0, 0, 0);
+
+        // ソース: jvndb_id=JVN-001 の行
+        var srcRows = new List<Dictionary<string, object?>>
+        {
+            new(StringComparer.OrdinalIgnoreCase)
+            {
+                ["hvn_id"] = 1, ["jvndb_id"] = "JVN-001", ["nvd_id"] = "CVE-2026-0001",
+                ["is_update"] = 0, ["is_reject"] = 0,
+                ["published_date"] = dt1, ["last_modified_date"] = dt1, ["create_date"] = dt1
+            },
+            new(StringComparer.OrdinalIgnoreCase)
+            {
+                ["hvn_id"] = 2, ["jvndb_id"] = "JVN-002", ["nvd_id"] = "CVE-2026-0002",
+                ["is_update"] = 0, ["is_reject"] = 0,
+                ["published_date"] = dt1, ["last_modified_date"] = dt1, ["create_date"] = dt1
+            }
+        };
+
+        // ターゲット: jvndb_id=JVN-001 は is_update が変更、JVN-002 は同一
+        var tgtRows = new List<Dictionary<string, object?>>
+        {
+            new(StringComparer.OrdinalIgnoreCase)
+            {
+                ["hvn_id"] = 10, ["jvndb_id"] = "JVN-001", ["nvd_id"] = "CVE-2026-0001",
+                ["is_update"] = 1, ["is_reject"] = 0,
+                ["published_date"] = dt1, ["last_modified_date"] = dt2, ["create_date"] = dt1
+            },
+            new(StringComparer.OrdinalIgnoreCase)
+            {
+                ["hvn_id"] = 2, ["jvndb_id"] = "JVN-002", ["nvd_id"] = "CVE-2026-0002",
+                ["is_update"] = 0, ["is_reject"] = 0,
+                ["published_date"] = dt1, ["last_modified_date"] = dt1, ["create_date"] = dt1
+            }
+        };
+
+        var forcePkColumns = new List<string> { "jvndb_id" };
+        var configColumns = new[] { "hvn_id", "jvndb_id", "nvd_id", "is_update", "is_reject", "published_date", "last_modified_date", "create_date" };
+
+        var tableConfig = new IncludeTableConfig
+        {
+            Name = "hvn",
+            Columns = configColumns,
+            ForcePK = forcePkColumns,
+            IgnorePK = false,
+            ModifiedKey = "",
+            AlternativeKey = new List<string>()
+        };
+
+        var pkNames = forcePkColumns.ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var compareColNames = configColumns.Where(c => !pkNames.Contains(c)).ToArray();
+
+        var srcCtx = CreateForcePkMockContext(srcRows, columns, primaryKeys, forcePkColumns, configColumns, compareColNames);
+        var tgtCtx = CreateForcePkMockContext(tgtRows, columns, primaryKeys, forcePkColumns, configColumns, compareColNames);
+
+        var settings = new MySqlVerifierSettings
+        {
+            Source = new HscTool.Model.Json.MySQL { Database = "source_db" },
+            Target = new HscTool.Model.Json.MySQL { Database = "target_db" },
+            OutputDir = "/tmp/test_output",
+            IncludeTables = new[] { tableConfig }
+        };
+
+        var logger = new TestLogger();
+        var service = new MySqlVerifierService(logger, settings);
+
+        var srcFactoryField = typeof(MySqlVerifierService).GetField("_srcFactory",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        var tgtFactoryField = typeof(MySqlVerifierService).GetField("_tgtFactory",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        srcFactoryField!.SetValue(service, new TestDbContextFactory(srcCtx));
+        tgtFactoryField!.SetValue(service, new TestDbContextFactory(tgtCtx));
+
+        MySqlVerifierDiff.LastInstance = null;
+        var result = await service.CompareAsync();
+        Assert.True(result.Success, $"CompareAsync failed: {result.ErrorMessage}\nLogs:\n{string.Join("\n", logger.Messages)}");
+
+        var diff = MySqlVerifierDiff.LastInstance;
+        var entries = diff?.Entries ?? new List<RowDiff>();
+
+        // force_pk=jvndb_id で比較: JVN-001 は is_update 変更 → Modify、JVN-002 は同一 → 差分なし
+        var modifies = entries.Where(e => e.DiffType == DiffType.Modify).ToList();
+        var additions = entries.Where(e => e.DiffType == DiffType.Addition).ToList();
+        var deletes = entries.Where(e => e.DiffType == DiffType.Delete).ToList();
+
+        Assert.Single(modifies);
+        Assert.Empty(additions);
+        Assert.Empty(deletes);
+
+        // Modify 行の内容確認: jvndb_id=JVN-001
+        var mod = modifies[0];
+        Assert.NotNull(mod.SourceRow);
+        Assert.NotNull(mod.TargetRow);
+    }
+
+    private static InMemoryDbContext CreateForcePkMockContext(
+        List<Dictionary<string, object?>> tableRows,
+        List<ColumnInfo> columns,
+        List<ColumnInfo> primaryKeys,
+        List<string> forcePkColumns,
+        string[] configColumns,
+        string[] compareColNames)
+    {
+        var ctx = new InMemoryDbContext();
+        ctx.QueryHandler = sql =>
+        {
+            sql = sql.Trim();
+
+            if (sql.Contains("INFORMATION_SCHEMA.COLUMNS"))
+            {
+                return columns.Select(c => new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase)
+                {
+                    ["TABLE_NAME"] = "hvn",
+                    ["COLUMN_NAME"] = c.ColumnName,
+                    ["DATA_TYPE"] = c.DataType,
+                    ["IS_NULLABLE"] = c.IsNullable ? "YES" : "NO",
+                    ["COLUMN_TYPE"] = c.ColumnType,
+                    ["COLUMN_KEY"] = c.IsPrimaryKey ? "PRI" : ""
+                }).ToList();
+            }
+
+            if (sql.Contains("KEY_COLUMN_USAGE"))
+            {
+                return primaryKeys.Select((pk, idx) => new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase)
+                {
+                    ["TABLE_NAME"] = "hvn",
+                    ["COLUMN_NAME"] = pk.ColumnName,
+                    ["ORDINAL_POSITION"] = idx + 1
+                }).ToList();
+            }
+
+            // CRC32 ハッシュクエリ: force_pk カラムを PK として使用
+            if (sql.Contains("CRC32") && sql.Contains("row_hash"))
+            {
+                return tableRows.Select(row =>
+                {
+                    var vals = compareColNames
+                        .Select(c => row.GetValueOrDefault(c)?.ToString() ?? "")
+                        .ToList();
+                    var hash = (uint)Math.Abs(string.Join("|", vals).GetHashCode());
+                    var result = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
+                    foreach (var pk in forcePkColumns)
+                        result[pk] = row.GetValueOrDefault(pk);
+                    result["row_hash"] = hash;
+                    return result;
+                }).ToList();
+            }
+
+            // WHERE 句による行フェッチ (IN パターン)
+            if (sql.Contains("WHERE") && sql.Contains("IN ("))
+            {
+                var inMatch = System.Text.RegularExpressions.Regex.Match(sql, @"IN\s*\((.+?)\)", System.Text.RegularExpressions.RegexOptions.Singleline);
+                if (inMatch.Success)
+                {
+                    var inValues = inMatch.Groups[1].Value
+                        .Split(',')
+                        .Select(v => v.Trim().Trim('\''))
+                        .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+                    return tableRows
+                        .Where(r => inValues.Contains(r.GetValueOrDefault(forcePkColumns[0])?.ToString() ?? ""))
+                        .ToList();
+                }
+            }
+
+            // WHERE 句による行フェッチ (OR パターン)
+            if (sql.Contains("WHERE"))
+            {
+                return tableRows;
+            }
+
+            return new List<Dictionary<string, object?>>();
+        };
+        return ctx;
     }
 }
 
