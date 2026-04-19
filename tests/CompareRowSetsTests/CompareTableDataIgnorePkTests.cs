@@ -506,6 +506,89 @@ public class CompareTableDataIgnorePkTests
         Assert.NotNull(mod.TargetRow);
     }
 
+    /// <summary>
+    /// 条件付き Ignore テスト: Modify 行で PK 値がソース/ターゲット同一なら実値を表示、
+    /// 異なるなら "Ignore" を表示。Addition/Delete 行は常に "Ignore"。
+    /// </summary>
+    [Fact]
+    public async Task ConditionalIgnore_SamePkShowsValue_DifferentPkShowsIgnore()
+    {
+        var (columns, primaryKeys) = CreateColumnMetadata();
+        var t1 = new DateTime(2026, 4, 1, 10, 0, 0);
+        var t2 = new DateTime(2026, 4, 10, 15, 0, 0);
+
+        // ソース: related_item_id=100
+        var srcRows = new List<Dictionary<string, object?>>
+        {
+            MakeRow(100, "JVNDB-2026-006630", "typeA", "advisoryB", 1808, "ProductName", "V001", "http://example.com/info", t1)
+        };
+
+        // ターゲット: related_item_id=100（同一PK）+ related_item_id=200（異なるPK、vendor_id変更）
+        // + related_item_id=300（純粋新規、AlternativeKeyが異なる）
+        var tgtRows = new List<Dictionary<string, object?>>
+        {
+            MakeRow(100, "JVNDB-2026-006630", "typeA", "advisoryB", 1808, "ProductName", "V001", "http://example.com/info", t1),
+            MakeRow(200, "JVNDB-2026-006630", "typeA", "advisoryB", 9233, "ProductName", "V001", "http://example.com/info", t2),
+            MakeRow(300, "JVNDB-2026-NEW001", "typeC", "advisoryD", 5000, "NewProduct", "V999", "http://example.com/new", t2)
+        };
+
+        var srcCtx = CreateMockContext(srcRows, columns, primaryKeys);
+        var tgtCtx = CreateMockContext(tgtRows, columns, primaryKeys);
+        var entries = await RunCompareAndGetDiffs(srcCtx, tgtCtx);
+
+        // Modify: ソース(100) vs ターゲット(200) — AlternativeKeyマッチ、PKが異なる → "Ignore"
+        var modifies = entries.Where(e => e.DiffType == DiffType.Modify).ToList();
+        Assert.Single(modifies);
+        var mod = modifies[0];
+
+        // related_item_id はソース=100、ターゲット=200 で異なる → "Ignore"
+        Assert.Equal("Ignore", mod.SourceRow!["related_item_id"]?.ToString());
+        Assert.Equal("Ignore", mod.TargetRow!["related_item_id"]?.ToString());
+
+        // Addition: 純粋新規 → 常に "Ignore"
+        var additions = entries.Where(e => e.DiffType == DiffType.Addition).ToList();
+        Assert.Single(additions);
+        Assert.Equal("Ignore", additions[0].TargetRow!["related_item_id"]?.ToString());
+    }
+
+    /// <summary>
+    /// 条件付き Ignore テスト: Modify 行でソースとターゲットの PK が同一の場合、実値を表示。
+    /// </summary>
+    [Fact]
+    public async Task ConditionalIgnore_SamePk_ShouldShowActualValue()
+    {
+        var (columns, primaryKeys) = CreateColumnMetadata();
+        var t1 = new DateTime(2026, 4, 1, 10, 0, 0);
+        var t2 = new DateTime(2026, 4, 10, 15, 0, 0);
+
+        // ソース: related_item_id=100
+        var srcRows = new List<Dictionary<string, object?>>
+        {
+            MakeRow(100, "JVNDB-2026-006630", "typeA", "advisoryB", 1808, "ProductName", "V001", "http://example.com/info", t1)
+        };
+
+        // ターゲット: related_item_id=100（同一PK）+ vendor_id が変更。
+        // ここでは t1 のハッシュ一致グループで消し込みされず、vendor_id だけが異なる。
+        // ターゲットに旧行(t1)+新行(t2)があり、旧行は完全一致消し込み、新行がModify対象
+        var tgtRows = new List<Dictionary<string, object?>>
+        {
+            MakeRow(100, "JVNDB-2026-006630", "typeA", "advisoryB", 1808, "ProductName", "V001", "http://example.com/info", t1),
+            MakeRow(100, "JVNDB-2026-006630", "typeA", "advisoryB", 9233, "ProductName", "V001", "http://example.com/info", t2)
+        };
+
+        var srcCtx = CreateMockContext(srcRows, columns, primaryKeys);
+        var tgtCtx = CreateMockContext(tgtRows, columns, primaryKeys);
+        var entries = await RunCompareAndGetDiffs(srcCtx, tgtCtx);
+
+        var modifies = entries.Where(e => e.DiffType == DiffType.Modify).ToList();
+        Assert.Single(modifies);
+        var mod = modifies[0];
+
+        // related_item_id はソース=100、ターゲット=100 で同一 → 実値 "100" を表示
+        Assert.Equal("100", mod.SourceRow!["related_item_id"]?.ToString());
+        Assert.Equal("100", mod.TargetRow!["related_item_id"]?.ToString());
+    }
+
     private static InMemoryDbContext CreateForcePkMockContext(
         List<Dictionary<string, object?>> tableRows,
         List<ColumnInfo> columns,

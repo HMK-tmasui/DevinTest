@@ -606,11 +606,10 @@ public class MySqlVerifierService
 					var altKey = AltKey(finalTgtOnly[i]);
 					if (matchedSrcByAltKey.TryGetValue(altKey, out var srcCandidates) && srcCandidates.Count > 0)
 					{
-						var srcRow = srcCandidates[0];
+							var srcRow = srcCandidates[0];
 						srcCandidates.RemoveAt(0);
-							diff.AddEntry(DiffType.Modify, pkColumns,
-							SetPkToIgnore(srcRow, ignorePkColumns),
-							SetPkToIgnore(finalTgtOnly[i], ignorePkColumns), nonPkCompareColumns);
+							var (modSrc, modTgt) = SetPkConditionalIgnore(srcRow, finalTgtOnly[i], ignorePkColumns);
+							diff.AddEntry(DiffType.Modify, pkColumns, modSrc, modTgt, nonPkCompareColumns);
 						resolved.Add(i);
 					}
 				}
@@ -643,11 +642,10 @@ public class MySqlVerifierService
 					var altKey = AltKey(finalSrcOnly[i]);
 					if (matchedTgtByAltKey.TryGetValue(altKey, out var tgtCandidates) && tgtCandidates.Count > 0)
 					{
-						var tgtRow = tgtCandidates[0];
+							var tgtRow = tgtCandidates[0];
 						tgtCandidates.RemoveAt(0);
-						diff.AddEntry(DiffType.Modify, pkColumns,
-							SetPkToIgnore(finalSrcOnly[i], ignorePkColumns),
-							SetPkToIgnore(tgtRow, ignorePkColumns), nonPkCompareColumns);
+						var (modSrc2, modTgt2) = SetPkConditionalIgnore(finalSrcOnly[i], tgtRow, ignorePkColumns);
+						diff.AddEntry(DiffType.Modify, pkColumns, modSrc2, modTgt2, nonPkCompareColumns);
 						resolved.Add(i);
 					}
 				}
@@ -771,9 +769,8 @@ public class MySqlVerifierService
 			{
 				pairedSrc.Add(srcIndices[i]);
 				pairedTgt.Add(tgtIndices[i]);
-				diff.AddEntry(DiffType.Modify, pkColumns,
-					SetPkToIgnore(unmatchedSrc[srcIndices[i]], setPkIgnoreCols),
-					SetPkToIgnore(unmatchedTgt[tgtIndices[i]], setPkIgnoreCols), nonPkCompareColumns);
+				var (modSrc, modTgt) = SetPkConditionalIgnore(unmatchedSrc[srcIndices[i]], unmatchedTgt[tgtIndices[i]], setPkIgnoreCols);
+				diff.AddEntry(DiffType.Modify, pkColumns, modSrc, modTgt, nonPkCompareColumns);
 			}
 		}
 
@@ -799,6 +796,27 @@ public class MySqlVerifierService
 		var newRow = new Dictionary<string, object?>(row, StringComparer.OrdinalIgnoreCase);
 		foreach (var pk in pkColumns) newRow[pk] = "Ignore";
 		return newRow;
+	}
+
+	/// <summary>
+	/// Modify行用: ソースとターゲットのPK値が同一なら実値を保持、異なるなら "Ignore" に設定。
+	/// </summary>
+	private static (Dictionary<string, object?> src, Dictionary<string, object?> tgt) SetPkConditionalIgnore(
+		Dictionary<string, object?> srcRow, Dictionary<string, object?> tgtRow, List<string> pkColumns)
+	{
+		var newSrc = new Dictionary<string, object?>(srcRow, StringComparer.OrdinalIgnoreCase);
+		var newTgt = new Dictionary<string, object?>(tgtRow, StringComparer.OrdinalIgnoreCase);
+		foreach (var pk in pkColumns)
+		{
+			var srcVal = FormatColumnValue(srcRow.GetValueOrDefault(pk));
+			var tgtVal = FormatColumnValue(tgtRow.GetValueOrDefault(pk));
+			if (srcVal != tgtVal)
+			{
+				newSrc[pk] = "Ignore";
+				newTgt[pk] = "Ignore";
+			}
+		}
+		return (newSrc, newTgt);
 	}
 
 	private string BuildGroupHashSqlIgnorePk(
