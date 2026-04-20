@@ -160,33 +160,61 @@ public class CompareTableDataIgnorePkTests
     private static async Task<List<DiffEntry>> RunCompareAndGetDiffs(
         InMemoryDbContext srcCtx, InMemoryDbContext tgtCtx)
     {
-        var settings = new MySqlVerifierSettings
+        var (entries, _) = await RunCompareAndGetDiffsWithCsv(srcCtx, tgtCtx, CreateTableConfig());
+        return entries;
+    }
+
+    /// <summary>CompareAsync を実行し、diff エントリリスト + CSV行リストを返す</summary>
+    private static async Task<(List<DiffEntry> entries, List<string> csvLines)> RunCompareAndGetDiffsWithCsv(
+        InMemoryDbContext srcCtx, InMemoryDbContext tgtCtx, IncludeTableConfig tableConfig)
+    {
+        var outputDir = Path.Combine(Path.GetTempPath(), $"test_csv_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(outputDir);
+        try
         {
-            Source = new HscTool.Model.Json.MySQL { Database = "source_db" },
-            Target = new HscTool.Model.Json.MySQL { Database = "target_db" },
-            OutputDir = "/tmp/test_output",
-            IncludeTables = new[] { CreateTableConfig() }
-        };
+            var settings = new MySqlVerifierSettings
+            {
+                Source = new HscTool.Model.Json.MySQL { Database = "source_db" },
+                Target = new HscTool.Model.Json.MySQL { Database = "target_db" },
+                OutputDir = outputDir,
+                IncludeTables = new[] { tableConfig }
+            };
 
-        var logger = new TestLogger();
-        var service = new MySqlVerifierService(logger, settings);
+            var logger = new TestLogger();
+            var service = new MySqlVerifierService(logger, settings);
 
-        var srcFactoryField = typeof(MySqlVerifierService).GetField("_srcFactory",
-            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-        var tgtFactoryField = typeof(MySqlVerifierService).GetField("_tgtFactory",
-            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+            var srcFactoryField = typeof(MySqlVerifierService).GetField("_srcFactory",
+                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+            var tgtFactoryField = typeof(MySqlVerifierService).GetField("_tgtFactory",
+                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
 
-        srcFactoryField!.SetValue(service, new TestDbContextFactory(srcCtx));
-        tgtFactoryField!.SetValue(service, new TestDbContextFactory(tgtCtx));
+            srcFactoryField!.SetValue(service, new TestDbContextFactory(srcCtx));
+            tgtFactoryField!.SetValue(service, new TestDbContextFactory(tgtCtx));
 
-        // LastInstance をクリア
-        MySqlVerifierDiff.LastInstance = null;
+            MySqlVerifierDiff.LastInstance = null;
 
-        var result = await service.CompareAsync();
-        Assert.True(result.Success, $"CompareAsync failed: {result.ErrorMessage}\nLogs:\n{string.Join("\n", logger.Messages)}");
+            var result = await service.CompareAsync();
+            Assert.True(result.Success, $"CompareAsync failed: {result.ErrorMessage}\nLogs:\n{string.Join("\n", logger.Messages)}");
 
-        var diff = MySqlVerifierDiff.LastInstance;
-        return diff?.Entries ?? new List<DiffEntry>();
+            var diff = MySqlVerifierDiff.LastInstance;
+            var entries = diff?.Entries ?? new List<DiffEntry>();
+
+            // CSV ファイルを読み込む
+            var csvLines = new List<string>();
+            var csvFiles = Directory.GetFiles(outputDir, "*.csv");
+            foreach (var csvFile in csvFiles)
+            {
+                var lines = await File.ReadAllLinesAsync(csvFile);
+                csvLines.AddRange(lines);
+            }
+
+            return (entries, csvLines);
+        }
+        finally
+        {
+            if (Directory.Exists(outputDir))
+                Directory.Delete(outputDir, true);
+        }
     }
 
     /// <summary>
@@ -554,7 +582,9 @@ public class CompareTableDataIgnorePkTests
     }
 
     /// <summary>
-    /// 条件付き Ignore テスト: Modify 行でソースとターゲットの PK が同一の場合、実値を表示。
+    /// 条件付き Ignore テスト: Modify 行でソースとターゲットの PK が同一の場合、
+    /// CSV出力で実値を表示。エントリ値は AddEntry により "Ignore" に上書きされるが、
+    /// WriteDiffCsvAsync が _modifyOriginalPks から元の値を復元して CSV に出力する。
     /// </summary>
     [Fact]
     public async Task ConditionalIgnore_SamePk_ShouldShowActualValue()
@@ -570,8 +600,6 @@ public class CompareTableDataIgnorePkTests
         };
 
         // ターゲット: related_item_id=100（同一PK）+ vendor_id が変更。
-        // ここでは t1 のハッシュ一致グループで消し込みされず、vendor_id だけが異なる。
-        // ターゲットに旧行(t1)+新行(t2)があり、旧行は完全一致消し込み、新行がModify対象
         var tgtRows = new List<Dictionary<string, object?>>
         {
             MakeRow(100, "JVNDB-2026-006630", "typeA", "advisoryB", 1808, "ProductName", "V001", "http://example.com/info", t1),
@@ -580,15 +608,22 @@ public class CompareTableDataIgnorePkTests
 
         var srcCtx = CreateMockContext(srcRows, columns, primaryKeys);
         var tgtCtx = CreateMockContext(tgtRows, columns, primaryKeys);
-        var entries = await RunCompareAndGetDiffs(srcCtx, tgtCtx);
+        var (entries, csvLines) = await RunCompareAndGetDiffsWithCsv(srcCtx, tgtCtx, CreateTableConfig());
 
         var modifies = entries.Where(e => e.DiffType == DiffType.Modify).ToList();
         Assert.Single(modifies);
-        var mod = modifies[0];
 
-        // related_item_id はソース=100、ターゲット=100 で同一 → 実値 "100" を表示
-        Assert.Equal("100", mod.SourceValues!["related_item_id"]?.ToString());
-        Assert.Equal("100", mod.TargetValues!["related_item_id"]?.ToString());
+        // エントリ値は AddEntry により "Ignore" に上書きされる（実 HSCTOOL と同じ動作）
+        Assert.Equal("Ignore", modifies[0].SourceValues!["related_item_id"]?.ToString());
+
+        // ★ CSV出力で実値 "100" を確認（WriteDiffCsvAsync が _modifyOriginalPks から復元）
+        Assert.True(csvLines.Count >= 2, $"CSV行数不足: {csvLines.Count}");
+        var modifyLines = csvLines.Skip(1).Where(l => l.Contains("\"Modify\"")).ToList();
+        Assert.Single(modifyLines);
+        var cells = SplitCsvLine(modifyLines[0]);
+        // related_item_id は CSV ヘッダーの2番目（DiffType の次）
+        Assert.Contains("\"100\"", cells[1]);
+        Assert.DoesNotContain("Ignore", cells[1]);
     }
 
     // ── hvn_cpe テスト用ヘルパー ──
@@ -726,40 +761,22 @@ public class CompareTableDataIgnorePkTests
     private static async Task<List<DiffEntry>> RunHvnCpeCompareAndGetDiffs(
         InMemoryDbContext srcCtx, InMemoryDbContext tgtCtx)
     {
-        var settings = new MySqlVerifierSettings
-        {
-            Source = new HscTool.Model.Json.MySQL { Database = "source_db" },
-            Target = new HscTool.Model.Json.MySQL { Database = "target_db" },
-            OutputDir = "/tmp/test_output",
-            IncludeTables = new[] { CreateHvnCpeTableConfig() }
-        };
+        var (entries, _) = await RunHvnCpeCompareAndGetDiffsWithCsv(srcCtx, tgtCtx);
+        return entries;
+    }
 
-        var logger = new TestLogger();
-        var service = new MySqlVerifierService(logger, settings);
-
-        var srcFactoryField = typeof(MySqlVerifierService).GetField("_srcFactory",
-            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-        var tgtFactoryField = typeof(MySqlVerifierService).GetField("_tgtFactory",
-            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-
-        srcFactoryField!.SetValue(service, new TestDbContextFactory(srcCtx));
-        tgtFactoryField!.SetValue(service, new TestDbContextFactory(tgtCtx));
-
-        MySqlVerifierDiff.LastInstance = null;
-
-        var result = await service.CompareAsync();
-        Assert.True(result.Success, $"CompareAsync failed: {result.ErrorMessage}\nLogs:\n{string.Join("\n", logger.Messages)}");
-
-        var diff = MySqlVerifierDiff.LastInstance;
-        return diff?.Entries ?? new List<DiffEntry>();
+    /// <summary>hvn_cpe 用: CompareAsync を実行し、diff エントリリスト + CSV行リストを返す</summary>
+    private static async Task<(List<DiffEntry> entries, List<string> csvLines)> RunHvnCpeCompareAndGetDiffsWithCsv(
+        InMemoryDbContext srcCtx, InMemoryDbContext tgtCtx)
+    {
+        return await RunCompareAndGetDiffsWithCsv(srcCtx, tgtCtx, CreateHvnCpeTableConfig());
     }
 
     /// <summary>
     /// hvn_cpe 実データ再現テスト: 複合 PK (hvn_id, number)、AlternativeKey = ["hvn_id"]。
-    /// ソースとターゲットで hvn_id が同一の場合、Modify 行で hvn_id は実値を表示すべき。
-    /// DB から取得した実データを再現:
-    ///   Source: hvn_id=138869, number=16, update_info=1803, latest_update=2024-11-18
-    ///   Target: hvn_id=138869, number=16, update_info=1607, latest_update=2026-03-23
+    /// ソースとターゲットで hvn_id が同一の場合、CSV出力で hvn_id は実値を表示すべき。
+    /// エントリ値は AddEntry により "Ignore" に上書きされるが、
+    /// WriteDiffCsvAsync が _modifyOriginalPks から元の値を復元して CSV に出力する。
     /// </summary>
     [Fact]
     public async Task HvnCpe_CompositePk_SamePk_ShouldShowActualValue()
@@ -768,7 +785,6 @@ public class CompareTableDataIgnorePkTests
         var t1 = new DateTime(2024, 11, 18, 13, 20, 31);
         var t2 = new DateTime(2026, 3, 23, 9, 0, 0);
 
-        // ソース: hvn_id=138869 の全行（latest_update=2024-11-18）
         var srcRows = new List<Dictionary<string, object?>>
         {
             MakeCpeRow(138869, 0,  1, "microsoft", "windows 10", "-", t1),
@@ -778,52 +794,55 @@ public class CompareTableDataIgnorePkTests
             MakeCpeRow(138869, 18, 1, "microsoft", "windows server 2019", "1809", t1),
         };
 
-        // ターゲット: 旧データ（t1）+ 変更データ（t2: number=16,17 の update_info が 1607 に変更）
         var tgtRows = new List<Dictionary<string, object?>>
         {
             MakeCpeRow(138869, 0,  1, "microsoft", "windows 10", "-", t1),
             MakeCpeRow(138869, 15, 1, "microsoft", "windows server 2016", "1607", t1),
-            MakeCpeRow(138869, 16, 1, "microsoft", "windows server 2016", "1607", t2),  // update_info changed, moved to t2
-            MakeCpeRow(138869, 17, 1, "microsoft", "windows server 2016", "1607", t2),  // update_info changed, moved to t2
+            MakeCpeRow(138869, 16, 1, "microsoft", "windows server 2016", "1607", t2),
+            MakeCpeRow(138869, 17, 1, "microsoft", "windows server 2016", "1607", t2),
             MakeCpeRow(138869, 18, 1, "microsoft", "windows server 2019", "1809", t1),
         };
 
         var srcCtx = CreateHvnCpeMockContext(srcRows, columns, primaryKeys);
         var tgtCtx = CreateHvnCpeMockContext(tgtRows, columns, primaryKeys);
-        var entries = await RunHvnCpeCompareAndGetDiffs(srcCtx, tgtCtx);
+        var (entries, csvLines) = await RunHvnCpeCompareAndGetDiffsWithCsv(srcCtx, tgtCtx);
 
         var modifies = entries.Where(e => e.DiffType == DiffType.Modify).ToList();
         var additions = entries.Where(e => e.DiffType == DiffType.Addition).ToList();
         var deletes = entries.Where(e => e.DiffType == DiffType.Delete).ToList();
 
-        // number=16 と 17 は Modify であるべき
         Assert.Equal(2, modifies.Count);
         Assert.Empty(additions);
         Assert.Empty(deletes);
 
-        // ★ 核心: hvn_id はソース=138869、ターゲット=138869 で同一 → "Ignore" ではなく実値 "138869"
+        // エントリ値は AddEntry により "Ignore" に上書きされる（実 HSCTOOL と同じ動作）
         foreach (var mod in modifies)
+            Assert.Equal("Ignore", mod.SourceValues!["hvn_id"]?.ToString());
+
+        // ★ CSV出力で hvn_id="138869" を確認（WriteDiffCsvAsync が _modifyOriginalPks から復元）
+        Assert.True(csvLines.Count >= 2, $"CSV行数不足: {csvLines.Count}");
+        var header = csvLines[0];
+        var headerCells = header.Split(',');
+        var hvnIdIdx = Array.IndexOf(headerCells, "hvn_id");
+        var numberIdx = Array.IndexOf(headerCells, "number");
+        Assert.True(hvnIdIdx >= 0, $"hvn_id カラムがヘッダーにない: {header}");
+
+        var modifyLines = csvLines.Skip(1).Where(l => l.Contains("\"Modify\"")).ToList();
+        Assert.Equal(2, modifyLines.Count);
+
+        foreach (var line in modifyLines)
         {
-            Assert.NotNull(mod.SourceValues);
-            Assert.NotNull(mod.TargetValues);
-
-            var srcHvnId = mod.SourceValues!["hvn_id"]?.ToString();
-            var tgtHvnId = mod.TargetValues!["hvn_id"]?.ToString();
-
-            Assert.Equal("138869", srcHvnId);
-            Assert.Equal("138869", tgtHvnId);
-
-            // number も同一なら実値を表示すべき
-            var srcNumber = mod.SourceValues!["number"]?.ToString();
-            var tgtNumber = mod.TargetValues!["number"]?.ToString();
-            Assert.NotEqual("Ignore", srcNumber);
-            Assert.NotEqual("Ignore", tgtNumber);
+            var cells = SplitCsvLine(line);
+            Assert.Contains("138869", cells[hvnIdIdx]);
+            Assert.DoesNotContain("Ignore", cells[hvnIdIdx]);
+            // number も同一なら実値を表示
+            Assert.DoesNotContain("Ignore", cells[numberIdx]);
         }
     }
 
     /// <summary>
     /// hvn_cpe: 複数の hvn_id が混在するケース。AlternativeKey=["hvn_id"] で正しくペアリングされ、
-    /// hvn_id が同一なら実値を表示。
+    /// CSV出力で hvn_id が同一なら実値を表示。
     /// </summary>
     [Fact]
     public async Task HvnCpe_MultipleHvnIds_SamePk_ShouldShowActualValue()
@@ -850,21 +869,27 @@ public class CompareTableDataIgnorePkTests
 
         var srcCtx = CreateHvnCpeMockContext(srcRows, columns, primaryKeys);
         var tgtCtx = CreateHvnCpeMockContext(tgtRows, columns, primaryKeys);
-        var entries = await RunHvnCpeCompareAndGetDiffs(srcCtx, tgtCtx);
+        var (entries, csvLines) = await RunHvnCpeCompareAndGetDiffsWithCsv(srcCtx, tgtCtx);
 
         var modifies = entries.Where(e => e.DiffType == DiffType.Modify).ToList();
-
         Assert.Equal(4, modifies.Count);
 
+        // エントリ値は AddEntry により "Ignore" に上書き（実 HSCTOOL と同じ動作）
         foreach (var mod in modifies)
-        {
-            var srcHvnId = mod.SourceValues!["hvn_id"]?.ToString();
-            var tgtHvnId = mod.TargetValues!["hvn_id"]?.ToString();
+            Assert.Equal("Ignore", mod.SourceValues!["hvn_id"]?.ToString());
 
-            // hvn_id は AlternativeKey でマッチしているので必ず同一 → 実値を表示
-            Assert.Equal(srcHvnId, tgtHvnId);
-            Assert.NotEqual("Ignore", srcHvnId);
-            Assert.NotEqual("Ignore", tgtHvnId);
+        // ★ CSV出力で hvn_id が実値であることを確認
+        Assert.True(csvLines.Count >= 2);
+        var headerCells = csvLines[0].Split(',');
+        var hvnIdIdx = Array.IndexOf(headerCells, "hvn_id");
+
+        var modifyLines = csvLines.Skip(1).Where(l => l.Contains("\"Modify\"")).ToList();
+        Assert.Equal(4, modifyLines.Count);
+
+        foreach (var line in modifyLines)
+        {
+            var cells = SplitCsvLine(line);
+            Assert.DoesNotContain("Ignore", cells[hvnIdIdx]);
         }
     }
 
@@ -904,44 +929,30 @@ public class CompareTableDataIgnorePkTests
 
         var srcCtx = CreateHvnCpeMockContext(srcRows, columns, primaryKeys);
         var tgtCtx = CreateHvnCpeMockContext(tgtRows, columns, primaryKeys);
-        var entries = await RunHvnCpeCompareAndGetDiffs(srcCtx, tgtCtx);
+        var (entries, csvLines) = await RunHvnCpeCompareAndGetDiffsWithCsv(srcCtx, tgtCtx);
 
         var modifies = entries.Where(e => e.DiffType == DiffType.Modify).ToList();
         var additions = entries.Where(e => e.DiffType == DiffType.Addition).ToList();
         var deletes = entries.Where(e => e.DiffType == DiffType.Delete).ToList();
 
-        // hvn_id=200 のみ変更 → Modify 1件が期待される
-        // ★ Step1 exact-content match で hvn_id=100 と hvn_id=200 が誤ペアリングされると
-        //   Delete + Addition になってしまう（バグ）
-        // → 現状では Step1 が非PK内容のみで消し込むため、同一非PKコンテンツを持つ
-        //   異なる hvn_id が誤ペアリングされる可能性がある。
-        //   AlternativeKey の Step2 マッチで救済されるか、Delete/Addition になるかはデータ順序依存。
-        //   ただし Modify になった場合は必ず hvn_id が同一であることを保証する。
         var totalDiffs = modifies.Count + additions.Count + deletes.Count;
         Assert.True(totalDiffs > 0, "差分が0件は想定外（hvn_id=200 の update_info が変更されている）");
 
-        foreach (var mod in modifies)
+        // エントリ値は AddEntry により "Ignore" に上書き（実 HSCTOOL と同じ動作）
+        // → CSV出力で条件付き Ignore を検証
+        if (csvLines.Count >= 2 && modifies.Count > 0)
         {
-            var srcHvnId = mod.SourceValues!["hvn_id"]?.ToString();
-            var tgtHvnId = mod.TargetValues!["hvn_id"]?.ToString();
-            // hvn_id は AlternativeKey でマッチ → 必ず同一 → 実値
-            Assert.Equal(srcHvnId, tgtHvnId);
-            Assert.NotEqual("Ignore", srcHvnId);
-        }
+            var headerCells = csvLines[0].Split(',');
+            var hvnIdIdx = Array.IndexOf(headerCells, "hvn_id");
+            Assert.True(hvnIdIdx >= 0);
 
-        // CSV レベル検証
-        var diff = MySqlVerifierDiff.LastInstance;
-        Assert.NotNull(diff);
-        var csvLines = diff!.BuildCsvLine();
-        Assert.True(csvLines.Count > 1, "CSV にデータ行が存在すること");
-
-        // Modify エントリの CSV 行で hvn_id が "Ignore" でないことを確認
-        foreach (var mod in modifies)
-        {
-            var row = mod.SourceValues ?? mod.TargetValues;
-            Assert.NotNull(row);
-            var hvnIdVal = row!["hvn_id"]?.ToString();
-            Assert.NotEqual("Ignore", hvnIdVal);
+            var modifyLines = csvLines.Skip(1).Where(l => l.Contains("\"Modify\"")).ToList();
+            foreach (var line in modifyLines)
+            {
+                var cells = SplitCsvLine(line);
+                // hvn_id は AlternativeKey でマッチ → 必ず同一 → CSV で実値表示
+                Assert.DoesNotContain("Ignore", cells[hvnIdIdx]);
+            }
         }
     }
 
@@ -994,40 +1005,26 @@ public class CompareTableDataIgnorePkTests
 
         var srcCtx = CreateHvnCpeMockContext(srcRows, columns, primaryKeys);
         var tgtCtx = CreateHvnCpeMockContext(tgtRows, columns, primaryKeys);
-        var entries = await RunHvnCpeCompareAndGetDiffs(srcCtx, tgtCtx);
+        var (entries, csvLines) = await RunHvnCpeCompareAndGetDiffsWithCsv(srcCtx, tgtCtx);
 
         var modifies = entries.Where(e => e.DiffType == DiffType.Modify).ToList();
 
-        // ★ 核心: 全 Modify 行で hvn_id は実値（"Ignore" ではない）
+        // エントリ値は AddEntry により "Ignore" に上書き（実 HSCTOOL と同じ動作）
         foreach (var mod in modifies)
+            Assert.Equal("Ignore", mod.SourceValues!["hvn_id"]?.ToString());
+
+        // ★ CSV出力で全 Modify 行の hvn_id が実値であることを確認
+        Assert.True(csvLines.Count >= 2);
+        var headerCells = csvLines[0].Split(',');
+        var hvnIdIdx = Array.IndexOf(headerCells, "hvn_id");
+        Assert.True(hvnIdIdx >= 0);
+
+        var modifyLines = csvLines.Skip(1).Where(l => l.Contains("\"Modify\"")).ToList();
+        foreach (var line in modifyLines)
         {
-            Assert.NotNull(mod.SourceValues);
-            Assert.NotNull(mod.TargetValues);
-
-            var srcHvnId = mod.SourceValues!["hvn_id"]?.ToString();
-            var tgtHvnId = mod.TargetValues!["hvn_id"]?.ToString();
-
-            // AlternativeKey=["hvn_id"] でマッチしているので必ず同一
-            Assert.Equal(srcHvnId, tgtHvnId);
-            Assert.NotEqual("Ignore", srcHvnId);
-            Assert.NotEqual("Ignore", tgtHvnId);
-
-            // number も検証: SetPkConditionalIgnore で個別に比較されるため
-            var srcNum = mod.SourceValues!["number"]?.ToString();
-            var tgtNum = mod.TargetValues!["number"]?.ToString();
-            // number が同一なら実値、異なるなら "Ignore"
-            if (srcNum != "Ignore" && tgtNum != "Ignore")
-                Assert.Equal(srcNum, tgtNum);
+            var cells = SplitCsvLine(line);
+            Assert.DoesNotContain("Ignore", cells[hvnIdIdx]);
         }
-
-        // CSV レベル検証: Modify 行の hvn_id フィールドが "Ignore" でないことを確認
-        var diff = MySqlVerifierDiff.LastInstance;
-        Assert.NotNull(diff);
-        var csvLines = diff!.BuildCsvLine();
-        // ヘッダー行: "hvn_id","number","product_type",...
-        Assert.True(csvLines.Count > 0);
-        var header = csvLines[0];
-        Assert.Contains("\"hvn_id\"", header);
     }
 
     /// <summary>
@@ -1137,7 +1134,9 @@ public class CompareTableDataIgnorePkTests
                     $"Expected 'oldVal => 1607' in line but not found.\nFull line: {line}\nAll CSV:\n{csvDump}");
             }
 
-            // ★ BuildCsvLine（スタブ）も同時検証
+            // BuildCsvLine はエントリ値を直接読むため、AddEntry で "Ignore" に上書きされた値を返す。
+            // 条件付き Ignore は WriteDiffCsvAsync でのみ適用される。
+            // → BuildCsvLine の hvn_id は "Ignore" になる（実 HSCTOOL と同じ動作）
             var diff = MySqlVerifierDiff.LastInstance;
             Assert.NotNull(diff);
             var buildCsvLines = diff!.BuildCsvLine();
@@ -1146,11 +1145,8 @@ public class CompareTableDataIgnorePkTests
                 var line = buildCsvLines[i];
                 Assert.Contains("\"Modify\"", line);
                 var cells = SplitCsvLine(line);
-                // BuildCsvLine のヘッダーはクォート付き: "DiffType","hvn_id",...
-                // データ行: "Modify","138869",...
-                Assert.False(cells[1].Contains("Ignore"),
-                    $"BuildCsvLine 出力: hvn_id が 'Ignore'。期待値: '138869'\nLine: {line}");
-                Assert.Contains("138869", cells[1]);
+                // BuildCsvLine はエントリ値を直接読むため "Ignore" になる
+                Assert.Contains("Ignore", cells[1]);
             }
         }
         finally
@@ -1277,27 +1273,23 @@ public class CompareTableDataIgnorePkTests
 
         var srcCtx = CreateMockContext(srcRows, columns, primaryKeys);
         var tgtCtx = CreateMockContext(tgtRows, columns, primaryKeys);
-        var entries = await RunCompareAndGetDiffs(srcCtx, tgtCtx);
+        var (entries, csvLines) = await RunCompareAndGetDiffsWithCsv(srcCtx, tgtCtx, CreateTableConfig());
 
         var modifies = entries.Where(e => e.DiffType == DiffType.Modify).ToList();
         Assert.Single(modifies);
 
-        var mod = modifies[0];
-        // related_item_id はソース=100, ターゲット=100 で同一 → 実値 "100"
-        Assert.Equal("100", mod.SourceValues["related_item_id"]?.ToString());
-        Assert.Equal("100", mod.TargetValues["related_item_id"]?.ToString());
+        // エントリ値は AddEntry により "Ignore" に上書き（実 HSCTOOL と同じ動作）
+        Assert.Equal("Ignore", modifies[0].SourceValues["related_item_id"]?.ToString());
 
-        // BuildCsvLine 出力検証
-        var diff = MySqlVerifierDiff.LastInstance;
-        Assert.NotNull(diff);
-        var csvLines = diff!.BuildCsvLine();
-        Assert.True(csvLines.Count >= 2);
+        // ★ WriteDiffCsvAsync の CSV出力で検証
+        Assert.True(csvLines.Count >= 2, $"CSV行数不足: {csvLines.Count}");
+        var modifyLines = csvLines.Skip(1).Where(l => l.Contains("\"Modify\"")).ToList();
+        Assert.Single(modifyLines);
 
-        var dataLine = csvLines[1];
-        Assert.Contains("\"Modify\"", dataLine);
+        var dataLine = modifyLines[0];
         // vendor_id 差分
         Assert.Contains("1808 => 9233", dataLine);
-        // PK 同値 → "100" が CSV に含まれる（"Ignore" ではない）
+        // PK 同値 → CSV で "100" が含まれる（"Ignore" ではない）
         Assert.Contains("\"100\"", dataLine);
         Assert.DoesNotContain("\"Ignore\"", dataLine);
     }

@@ -239,11 +239,25 @@ namespace HscTool.Shared.Diff
                     if (srcVal != tgtVal) diffCols.Add(col);
                 }
             }
+
+            // 実 HSCTOOL の AddEntry と同じ動作: PK 値を "Ignore" に上書きする
+            var srcVals = sourceRow != null
+                ? new Dictionary<string, object?>(sourceRow, StringComparer.OrdinalIgnoreCase)
+                : new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
+            var tgtVals = targetRow != null
+                ? new Dictionary<string, object?>(targetRow, StringComparer.OrdinalIgnoreCase)
+                : new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
+            foreach (var pk in pkColumns)
+            {
+                if (srcVals.ContainsKey(pk)) srcVals[pk] = "Ignore";
+                if (tgtVals.ContainsKey(pk)) tgtVals[pk] = "Ignore";
+            }
+
             Entries.Add(new DiffEntry
             {
                 DiffType = diffType,
-                SourceValues = sourceRow ?? new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase),
-                TargetValues = targetRow ?? new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase),
+                SourceValues = srcVals,
+                TargetValues = tgtVals,
                 ChangedColumns = new HashSet<string>(diffCols, StringComparer.OrdinalIgnoreCase)
             });
         }
