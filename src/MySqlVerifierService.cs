@@ -1133,6 +1133,28 @@ public class MySqlVerifierService
 		return sb.ToString();
 	}
 
+	/// <summary>CSV 1セルのフォーマット: null → NULL、DateTime → yyyy-MM-dd HH:mm:ss、その他 → "値"</summary>
+	private static string FormatCsvCell(object? val)
+	{
+		if (val == null) return "NULL";
+		if (val is DateTime dt) return $"\"{dt:yyyy-MM-dd HH:mm:ss}\"";
+		var s = val.ToString() ?? "";
+		return $"\"{s.Replace("\"", "\"\"")}\"";
+	}
+
+	/// <summary>行の CSV 文字列を生成</summary>
+	private static string BuildCsvRow(string diffType, Dictionary<string, object?> row, List<string> columns)
+	{
+		var sb = new StringBuilder(columns.Count * 16);
+		sb.Append($"\"{diffType}\"");
+		foreach (var col in columns)
+		{
+			sb.Append(',');
+			sb.Append(FormatCsvCell(row.GetValueOrDefault(col)));
+		}
+		return sb.ToString();
+	}
+
 	private async Task WriteDiffCsvAsync(
 		string tableName,
 		MySqlVerifierDiff diff,
@@ -1140,18 +1162,50 @@ public class MySqlVerifierService
 		List<string> pkColumns,
 		bool ignorePk = false)
 	{
+		if (diff.DiffCount == 0) return;
+
 		var timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
 		var pkSuffix = ignorePk ? "_IgnorePK"
 			: pkColumns.Count > 0 ? $"_PK({string.Join(",", pkColumns)})" : "_NoPK";
 		var baseFileName = $"{tableName}_diff_{timestamp}{pkSuffix}";
 
-		// 全行を一括生成（index 0 = ヘッダー、1以降 = データ行）
-		var lines = diff.BuildCsvLine();
-
-		if (lines.Count <= 1) return; // ヘッダーのみ = データなし
-
-		var headerLine = lines[0];
+		// ヘッダー行: "diff_type","col1","col2",...
+		var headerLine = "\"diff_type\"," + string.Join(",", allColumns.Select(c => $"\"{c}\""));
 		var headerBytes = Encoding.UTF8.GetByteCount(headerLine + Environment.NewLine);
+
+		// diff.Entries から直接 CSV 行を生成（BuildCsvLine を経由しない）
+		// → SetPkConditionalIgnore で設定した条件付き Ignore 値がそのまま出力される
+		var lines = new List<string>();
+		foreach (var entry in diff.Entries)
+		{
+			var diffLabel = entry.DiffType switch
+			{
+				DiffType.Delete => "Delete",
+				DiffType.Addition => "Addition",
+				DiffType.Modify => "Modify",
+				_ => "Unknown"
+			};
+
+			if (entry.DiffType == DiffType.Modify)
+			{
+				// Modify: ソース行とターゲット行の両方を出力
+				if (entry.SourceRow != null)
+					lines.Add(BuildCsvRow(diffLabel, entry.SourceRow, allColumns));
+				if (entry.TargetRow != null)
+					lines.Add(BuildCsvRow(diffLabel, entry.TargetRow, allColumns));
+			}
+			else if (entry.DiffType == DiffType.Delete && entry.SourceRow != null)
+			{
+				lines.Add(BuildCsvRow(diffLabel, entry.SourceRow, allColumns));
+			}
+			else if (entry.DiffType == DiffType.Addition && entry.TargetRow != null)
+			{
+				lines.Add(BuildCsvRow(diffLabel, entry.TargetRow, allColumns));
+			}
+		}
+
+		if (lines.Count == 0) return;
+
 		var fileIndex = 1;
 		var currentSize = 0L;
 		StreamWriter? writer = null;
@@ -1159,7 +1213,7 @@ public class MySqlVerifierService
 
 		try
 		{
-			for (int i = 1; i < lines.Count; i++)
+			for (int i = 0; i < lines.Count; i++)
 			{
 				var lineBytes = Encoding.UTF8.GetByteCount(lines[i] + Environment.NewLine);
 
