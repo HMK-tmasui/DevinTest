@@ -1030,6 +1030,79 @@ public class CompareTableDataIgnorePkTests
     }
 
     /// <summary>
+    /// hvn_cpe 実データ CSV出力検証: hvn_id=138869, number=15/16/17。
+    /// Modify行でhvn_idが"138869"（実値）、update_infoが"1803 => 1607"形式であること。
+    /// </summary>
+    [Fact]
+    public async Task HvnCpe_CsvFormat_ModifyShouldShowActualHvnIdAndDiff()
+    {
+        var (columns, primaryKeys) = CreateHvnCpeColumnMetadata();
+        var t1 = new DateTime(2024, 11, 18, 13, 20, 31);
+        var t2 = new DateTime(2026, 3, 23, 9, 0, 0);
+
+        // ユーザー提供の実データパターン
+        var srcRows = new List<Dictionary<string, object?>>
+        {
+            MakeCpeRow(138869, 15, 1, "microsoft", "windows server 2016", "1607", t1),
+            MakeCpeRow(138869, 16, 1, "microsoft", "windows server 2016", "1803", t1),
+            MakeCpeRow(138869, 17, 1, "microsoft", "windows server 2016", "1903", t1),
+        };
+
+        var tgtRows = new List<Dictionary<string, object?>>
+        {
+            MakeCpeRow(138869, 15, 1, "microsoft", "windows server 2016", "1607", t1),
+            MakeCpeRow(138869, 16, 1, "microsoft", "windows server 2016", "1607", t2),
+            MakeCpeRow(138869, 17, 1, "microsoft", "windows server 2016", "1607", t2),
+        };
+
+        var srcCtx = CreateHvnCpeMockContext(srcRows, columns, primaryKeys);
+        var tgtCtx = CreateHvnCpeMockContext(tgtRows, columns, primaryKeys);
+        var entries = await RunHvnCpeCompareAndGetDiffs(srcCtx, tgtCtx);
+
+        // Modify が 2 件（number=16, 17）
+        var modifies = entries.Where(e => e.DiffType == DiffType.Modify).ToList();
+        Assert.Equal(2, modifies.Count);
+
+        // エントリレベル検証: hvn_id が実値であること
+        foreach (var mod in modifies)
+        {
+            Assert.Equal("138869", mod.SourceValues["hvn_id"]?.ToString());
+            Assert.Equal("138869", mod.TargetValues["hvn_id"]?.ToString());
+        }
+
+        // ★ CSV出力検証（BuildCsvLine）
+        var diff = MySqlVerifierDiff.LastInstance;
+        Assert.NotNull(diff);
+        var csvLines = diff!.BuildCsvLine();
+
+        // 全行をダンプ（テスト失敗時のデバッグ用）
+        var csvDump = string.Join("\n", csvLines.Select((line, idx) => $"[{idx}] {line}"));
+
+        // ヘッダー + 2 データ行
+        Assert.True(csvLines.Count >= 3, $"Expected >= 3 lines, got {csvLines.Count}.\nCSV:\n{csvDump}");
+
+        // 各 Modify データ行を検証
+        for (int i = 1; i < csvLines.Count; i++)
+        {
+            var line = csvLines[i];
+            // Modify 行であること
+            Assert.Contains("\"Modify\"", line);
+
+            // ★ 核心: hvn_id は "138869" であること（"Ignore" ではない）
+            // hvn_id は DiffType の次のカラム
+            var cells = line.Split(',');
+            // cells[0] = "Modify", cells[1] = hvn_id value
+            Assert.False(cells[1].Contains("Ignore"),
+                $"hvn_id should be '138869' but got {cells[1]}.\nFull line: {line}\nAll CSV:\n{csvDump}");
+            Assert.Contains("138869", cells[1]);
+
+            // update_info の変更差分が "=> 1607" を含むこと
+            Assert.True(line.Contains("=> 1607"),
+                $"Expected 'oldVal => 1607' in line but not found.\nFull line: {line}\nAll CSV:\n{csvDump}");
+        }
+    }
+
+    /// <summary>
     /// CSV出力フォーマット検証: Modify行は "oldVal => newVal" 形式で変更差分を出力し、
     /// PKカラムは条件付きIgnore値、未変更カラムは空文字であること。
     /// </summary>
