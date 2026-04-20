@@ -5,6 +5,7 @@ using System.Data;
 using System.Data.Common;
 using System.Linq;
 using System.Threading.Tasks;
+using MySqlConnector;
 
 namespace HscTool.Diagnostics
 {
@@ -47,7 +48,10 @@ namespace HscTool.Shared
         }
 
         public DbCommandWrapper CreateCommand() => new(_context);
-        public static void AddParameter(DbCommandWrapper cmd, string name, object value) { }
+        public static void AddParameter(DbCommandWrapper cmd, string name, object value)
+        {
+            cmd.Parameters[name] = value;
+        }
         public void Dispose() { }
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
@@ -56,11 +60,15 @@ namespace HscTool.Shared
     {
         private readonly IDbContext _context;
         public int CommandTimeout { get; set; }
+        internal Dictionary<string, object> Parameters { get; } = new();
 
         public DbCommandWrapper(IDbContext context) { _context = context; }
 
         public Task<DbReaderWrapper> ExecuteReaderAsync(string sql)
         {
+            // Substitute parameters in SQL
+            foreach (var p in Parameters)
+                sql = sql.Replace(p.Key, $"'{p.Value}'");
             return Task.FromResult(new DbReaderWrapper(_context.ExecuteQuery(sql)));
         }
 
@@ -136,7 +144,49 @@ namespace HscTool.Shared
     {
         private readonly HscTool.Model.Json.MySQL _config;
         public MySqlDbContextFactory(HscTool.Model.Json.MySQL config) { _config = config; }
-        public IDbContext CreateContext() => new InMemoryDbContext();
+        public IDbContext CreateContext()
+        {
+            if (!string.IsNullOrEmpty(_config.Server))
+                return new RealMySqlDbContext(_config.ToConnectionString());
+            return new InMemoryDbContext();
+        }
+    }
+
+    /// <summary>Real MySQL database context using MySqlConnector</summary>
+    public class RealMySqlDbContext : IDbContext
+    {
+        private readonly string _connectionString;
+
+        public RealMySqlDbContext(string connectionString)
+        {
+            _connectionString = connectionString;
+        }
+
+        public List<Dictionary<string, object?>> ExecuteQuery(string sql)
+        {
+            using var conn = new MySqlConnection(_connectionString);
+            conn.Open();
+            using var cmd = new MySqlCommand(sql, conn);
+            cmd.CommandTimeout = 300;
+            using var reader = cmd.ExecuteReader();
+
+            var results = new List<Dictionary<string, object?>>();
+            while (reader.Read())
+            {
+                var row = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
+                for (int i = 0; i < reader.FieldCount; i++)
+                {
+                    row[reader.GetName(i)] = reader.IsDBNull(i) ? null : reader.GetValue(i);
+                }
+                results.Add(row);
+            }
+            return results;
+        }
+
+        public ValueTask DisposeAsync()
+        {
+            return ValueTask.CompletedTask;
+        }
     }
 
     public class InMemoryDbContext : IDbContext
@@ -269,6 +319,13 @@ namespace HscTool.Model.Json
     public class MySQL
     {
         public string Database { get; set; } = "";
+        public string Server { get; set; } = "";
+        public int Port { get; set; } = 3306;
+        public string User { get; set; } = "";
+        public string Password { get; set; } = "";
+
+        public string ToConnectionString() =>
+            $"Server={Server};Port={Port};Database={Database};User={User};Password={Password};SslMode=None;AllowPublicKeyRetrieval=true;";
     }
 }
 
