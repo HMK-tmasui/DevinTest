@@ -5,6 +5,7 @@ using HvnDbVerifier;
 using HvnDbVerifier.Model.Json;
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
@@ -1031,7 +1032,9 @@ public class CompareTableDataIgnorePkTests
 
     /// <summary>
     /// hvn_cpe 実データ CSV出力検証: hvn_id=138869, number=15/16/17。
-    /// Modify行でhvn_idが"138869"（実値）、update_infoが"1803 => 1607"形式であること。
+    /// WriteDiffCsvAsync が生成する実際のCSVファイルを読み込み、
+    /// Modify行でhvn_idが"138869"（実値）、update_infoが"1803 => 1607"形式であることを検証。
+    /// BuildCsvLine（スタブ）ではなく、WriteDiffCsvAsync（本番コードパス）の出力を検証する。
     /// </summary>
     [Fact]
     public async Task HvnCpe_CsvFormat_ModifyShouldShowActualHvnIdAndDiff()
@@ -1055,51 +1058,142 @@ public class CompareTableDataIgnorePkTests
             MakeCpeRow(138869, 17, 1, "microsoft", "windows server 2016", "1607", t2),
         };
 
-        var srcCtx = CreateHvnCpeMockContext(srcRows, columns, primaryKeys);
-        var tgtCtx = CreateHvnCpeMockContext(tgtRows, columns, primaryKeys);
-        var entries = await RunHvnCpeCompareAndGetDiffs(srcCtx, tgtCtx);
+        // WriteDiffCsvAsync の出力先ディレクトリを準備
+        var outputDir = Path.Combine(Path.GetTempPath(), $"hvn_cpe_csv_test_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(outputDir);
 
-        // Modify が 2 件（number=16, 17）
-        var modifies = entries.Where(e => e.DiffType == DiffType.Modify).ToList();
-        Assert.Equal(2, modifies.Count);
-
-        // エントリレベル検証: hvn_id が実値であること
-        foreach (var mod in modifies)
+        try
         {
-            Assert.Equal("138869", mod.SourceValues["hvn_id"]?.ToString());
-            Assert.Equal("138869", mod.TargetValues["hvn_id"]?.ToString());
+            var srcCtx = CreateHvnCpeMockContext(srcRows, columns, primaryKeys);
+            var tgtCtx = CreateHvnCpeMockContext(tgtRows, columns, primaryKeys);
+
+            // OutputDir を一意のディレクトリに設定して CompareAsync 実行
+            var settings = new MySqlVerifierSettings
+            {
+                Source = new HscTool.Model.Json.MySQL { Database = "source_db" },
+                Target = new HscTool.Model.Json.MySQL { Database = "target_db" },
+                OutputDir = outputDir,
+                IncludeTables = new[] { CreateHvnCpeTableConfig() }
+            };
+
+            var logger = new TestLogger();
+            var service = new MySqlVerifierService(logger, settings);
+
+            var srcFactoryField = typeof(MySqlVerifierService).GetField("_srcFactory",
+                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+            var tgtFactoryField = typeof(MySqlVerifierService).GetField("_tgtFactory",
+                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+            srcFactoryField!.SetValue(service, new TestDbContextFactory(srcCtx));
+            tgtFactoryField!.SetValue(service, new TestDbContextFactory(tgtCtx));
+
+            MySqlVerifierDiff.LastInstance = null;
+            var result = await service.CompareAsync();
+            Assert.True(result.Success, $"CompareAsync failed: {result.ErrorMessage}\nLogs:\n{string.Join("\n", logger.Messages)}");
+
+            // ★ WriteDiffCsvAsync が生成した実際のCSVファイルを読み込む
+            var csvFiles = Directory.GetFiles(outputDir, "*.csv");
+            Assert.True(csvFiles.Length > 0, $"CSVファイルが生成されていない。OutputDir: {outputDir}\nLogs:\n{string.Join("\n", logger.Messages)}");
+
+            var allCsvLines = new List<string>();
+            foreach (var csvFile in csvFiles)
+            {
+                var lines = await File.ReadAllLinesAsync(csvFile);
+                allCsvLines.AddRange(lines);
+            }
+
+            var csvDump = string.Join("\n", allCsvLines.Select((line, idx) => $"[{idx}] {line}"));
+
+            // ヘッダー行の確認
+            Assert.True(allCsvLines.Count >= 1, $"CSVファイルが空。\n{csvDump}");
+            var header = allCsvLines[0];
+            Assert.Contains("DiffType", header);
+            Assert.Contains("hvn_id", header);
+
+            // hvn_id のカラムインデックスを特定
+            var headerCells = header.Split(',');
+            var hvnIdIndex = Array.IndexOf(headerCells, "hvn_id");
+            Assert.True(hvnIdIndex >= 0, $"hvn_id カラムがヘッダーにない: {header}");
+
+            // Modify データ行を検証
+            var modifyLines = allCsvLines.Skip(1).Where(l => l.Contains("\"Modify\"")).ToList();
+            Assert.True(modifyLines.Count >= 2, $"Modify行が2件未満: {modifyLines.Count}\nCSV:\n{csvDump}");
+
+            foreach (var line in modifyLines)
+            {
+                // CSV セルを分割（ダブルクォート内のカンマを考慮）
+                var cells = SplitCsvLine(line);
+                Assert.True(cells.Length > hvnIdIndex,
+                    $"セル数不足: expected > {hvnIdIndex}, got {cells.Length}\nLine: {line}");
+
+                var hvnIdCell = cells[hvnIdIndex];
+
+                // ★ 核心: hvn_id は "138869" であること（"Ignore" ではない）
+                Assert.False(hvnIdCell.Contains("Ignore"),
+                    $"WriteDiffCsvAsync 出力: hvn_id が 'Ignore'。期待値: '138869'\nhvn_id cell: {hvnIdCell}\nFull line: {line}\nAll CSV:\n{csvDump}");
+                Assert.Contains("138869", hvnIdCell);
+
+                // update_info の変更差分が "=> 1607" を含むこと
+                Assert.True(line.Contains("=> 1607"),
+                    $"Expected 'oldVal => 1607' in line but not found.\nFull line: {line}\nAll CSV:\n{csvDump}");
+            }
+
+            // ★ BuildCsvLine（スタブ）も同時検証
+            var diff = MySqlVerifierDiff.LastInstance;
+            Assert.NotNull(diff);
+            var buildCsvLines = diff!.BuildCsvLine();
+            for (int i = 1; i < buildCsvLines.Count; i++)
+            {
+                var line = buildCsvLines[i];
+                Assert.Contains("\"Modify\"", line);
+                var cells = SplitCsvLine(line);
+                // BuildCsvLine のヘッダーはクォート付き: "DiffType","hvn_id",...
+                // データ行: "Modify","138869",...
+                Assert.False(cells[1].Contains("Ignore"),
+                    $"BuildCsvLine 出力: hvn_id が 'Ignore'。期待値: '138869'\nLine: {line}");
+                Assert.Contains("138869", cells[1]);
+            }
         }
-
-        // ★ CSV出力検証（BuildCsvLine）
-        var diff = MySqlVerifierDiff.LastInstance;
-        Assert.NotNull(diff);
-        var csvLines = diff!.BuildCsvLine();
-
-        // 全行をダンプ（テスト失敗時のデバッグ用）
-        var csvDump = string.Join("\n", csvLines.Select((line, idx) => $"[{idx}] {line}"));
-
-        // ヘッダー + 2 データ行
-        Assert.True(csvLines.Count >= 3, $"Expected >= 3 lines, got {csvLines.Count}.\nCSV:\n{csvDump}");
-
-        // 各 Modify データ行を検証
-        for (int i = 1; i < csvLines.Count; i++)
+        finally
         {
-            var line = csvLines[i];
-            // Modify 行であること
-            Assert.Contains("\"Modify\"", line);
-
-            // ★ 核心: hvn_id は "138869" であること（"Ignore" ではない）
-            // hvn_id は DiffType の次のカラム
-            var cells = line.Split(',');
-            // cells[0] = "Modify", cells[1] = hvn_id value
-            Assert.False(cells[1].Contains("Ignore"),
-                $"hvn_id should be '138869' but got {cells[1]}.\nFull line: {line}\nAll CSV:\n{csvDump}");
-            Assert.Contains("138869", cells[1]);
-
-            // update_info の変更差分が "=> 1607" を含むこと
-            Assert.True(line.Contains("=> 1607"),
-                $"Expected 'oldVal => 1607' in line but not found.\nFull line: {line}\nAll CSV:\n{csvDump}");
+            // テスト後にディレクトリを削除
+            if (Directory.Exists(outputDir))
+                Directory.Delete(outputDir, true);
         }
+    }
+
+    /// <summary>CSV行をダブルクォート対応で分割</summary>
+    private static string[] SplitCsvLine(string line)
+    {
+        var result = new List<string>();
+        var current = "";
+        var inQuotes = false;
+        for (int i = 0; i < line.Length; i++)
+        {
+            if (line[i] == '"')
+            {
+                if (inQuotes && i + 1 < line.Length && line[i + 1] == '"')
+                {
+                    current += '"';
+                    i++;
+                }
+                else
+                {
+                    inQuotes = !inQuotes;
+                    current += '"';
+                }
+            }
+            else if (line[i] == ',' && !inQuotes)
+            {
+                result.Add(current);
+                current = "";
+            }
+            else
+            {
+                current += line[i];
+            }
+        }
+        result.Add(current);
+        return result.ToArray();
     }
 
     /// <summary>
