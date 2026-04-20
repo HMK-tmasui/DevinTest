@@ -158,12 +158,12 @@ namespace HscTool.Shared.Diff
 {
     public enum DiffType { Delete, Addition, Modify }
 
-    public class RowDiff
+    public class DiffEntry
     {
-        public DiffType DiffType { get; set; }
-        public Dictionary<string, object?>? SourceRow { get; set; }
-        public Dictionary<string, object?>? TargetRow { get; set; }
-        public List<string> DiffColumns { get; set; } = new();
+        public DiffType DiffType { get; init; }
+        public Dictionary<string, object?> SourceValues { get; init; } = new(StringComparer.OrdinalIgnoreCase);
+        public Dictionary<string, object?> TargetValues { get; init; } = new(StringComparer.OrdinalIgnoreCase);
+        public HashSet<string> ChangedColumns { get; init; } = new(StringComparer.OrdinalIgnoreCase);
 
         public static string FormatCsvValue(object? val)
         {
@@ -181,7 +181,7 @@ namespace HscTool.Shared.Diff
         /// <summary>テスト用: 最後に Init された diff インスタンスを保持</summary>
         public static MySqlVerifierDiff? LastInstance { get; set; }
 
-        public List<RowDiff> Entries { get; } = new();
+        public List<DiffEntry> Entries { get; } = new();
         public int DiffCount => Entries.Count;
 
         public void Init(List<string> allColumns, string[]? pkColumns)
@@ -205,12 +205,12 @@ namespace HscTool.Shared.Diff
                     if (srcVal != tgtVal) diffCols.Add(col);
                 }
             }
-            Entries.Add(new RowDiff
+            Entries.Add(new DiffEntry
             {
                 DiffType = diffType,
-                SourceRow = sourceRow,
-                TargetRow = targetRow,
-                DiffColumns = diffCols
+                SourceValues = sourceRow ?? new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase),
+                TargetValues = targetRow ?? new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase),
+                ChangedColumns = new HashSet<string>(diffCols, StringComparer.OrdinalIgnoreCase)
             });
         }
 
@@ -220,10 +220,10 @@ namespace HscTool.Shared.Diff
             lines.Add(string.Join(",", _allColumns.Select(c => $"\"{c}\"")));
             foreach (var entry in Entries)
             {
-                var row = entry.SourceRow ?? entry.TargetRow;
-                if (row == null) continue;
+                var row = entry.SourceValues.Count > 0 ? entry.SourceValues : entry.TargetValues;
+                if (row.Count == 0) continue;
                 lines.Add(string.Join(",", _allColumns.Select(c =>
-                    $"\"{RowDiff.FormatCsvValue(row.GetValueOrDefault(c))}\"")));
+                    $"\"{DiffEntry.FormatCsvValue(row.GetValueOrDefault(c))}\"")));
             }
             return lines;
         }

@@ -981,7 +981,7 @@ public class MySqlVerifierService
 			for (int i = 0; i < allColumns.Count; i++)
 			{
 				if (i > 0) sb.Append("|");
-				sb.Append(RowDiff.FormatCsvValue(row.GetValueOrDefault(allColumns[i])));
+				sb.Append(DiffEntry.FormatCsvValue(row.GetValueOrDefault(allColumns[i])));
 			}
 			AddToList(multiset, sb.ToString(), row);
 		}
@@ -1189,18 +1189,18 @@ public class MySqlVerifierService
 			if (entry.DiffType == DiffType.Modify)
 			{
 				// Modify: ソース行とターゲット行の両方を出力
-				if (entry.SourceRow != null)
-					lines.Add(BuildCsvRow(diffLabel, entry.SourceRow, allColumns));
-				if (entry.TargetRow != null)
-					lines.Add(BuildCsvRow(diffLabel, entry.TargetRow, allColumns));
+				if (entry.SourceValues.Count > 0)
+					lines.Add(BuildCsvRow(diffLabel, entry.SourceValues, allColumns));
+				if (entry.TargetValues.Count > 0)
+					lines.Add(BuildCsvRow(diffLabel, entry.TargetValues, allColumns));
 			}
-			else if (entry.DiffType == DiffType.Delete && entry.SourceRow != null)
+			else if (entry.DiffType == DiffType.Delete && entry.SourceValues.Count > 0)
 			{
-				lines.Add(BuildCsvRow(diffLabel, entry.SourceRow, allColumns));
+				lines.Add(BuildCsvRow(diffLabel, entry.SourceValues, allColumns));
 			}
-			else if (entry.DiffType == DiffType.Addition && entry.TargetRow != null)
+			else if (entry.DiffType == DiffType.Addition && entry.TargetValues.Count > 0)
 			{
-				lines.Add(BuildCsvRow(diffLabel, entry.TargetRow, allColumns));
+				lines.Add(BuildCsvRow(diffLabel, entry.TargetValues, allColumns));
 			}
 		}
 

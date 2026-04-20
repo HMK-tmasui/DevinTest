@@ -155,7 +155,7 @@ public class CompareTableDataIgnorePkTests
     }
 
     /// <summary>CompareAsync を実行し、diff エントリリストを返す</summary>
-    private static async Task<List<RowDiff>> RunCompareAndGetDiffs(
+    private static async Task<List<DiffEntry>> RunCompareAndGetDiffs(
         InMemoryDbContext srcCtx, InMemoryDbContext tgtCtx)
     {
         var settings = new MySqlVerifierSettings
@@ -184,7 +184,7 @@ public class CompareTableDataIgnorePkTests
         Assert.True(result.Success, $"CompareAsync failed: {result.ErrorMessage}\nLogs:\n{string.Join("\n", logger.Messages)}");
 
         var diff = MySqlVerifierDiff.LastInstance;
-        return diff?.Entries ?? new List<RowDiff>();
+        return diff?.Entries ?? new List<DiffEntry>();
     }
 
     /// <summary>
@@ -223,8 +223,8 @@ public class CompareTableDataIgnorePkTests
         Assert.Empty(deletes);
 
         var mod = modifies[0];
-        Assert.NotNull(mod.SourceRow);
-        Assert.NotNull(mod.TargetRow);
+        Assert.NotNull(mod.SourceValues);
+        Assert.NotNull(mod.TargetValues);
     }
 
     /// <summary>
@@ -489,7 +489,7 @@ public class CompareTableDataIgnorePkTests
         Assert.True(result.Success, $"CompareAsync failed: {result.ErrorMessage}\nLogs:\n{string.Join("\n", logger.Messages)}");
 
         var diff = MySqlVerifierDiff.LastInstance;
-        var entries = diff?.Entries ?? new List<RowDiff>();
+        var entries = diff?.Entries ?? new List<DiffEntry>();
 
         // force_pk=jvndb_id で比較: JVN-001 は is_update 変更 → Modify、JVN-002 は同一 → 差分なし
         var modifies = entries.Where(e => e.DiffType == DiffType.Modify).ToList();
@@ -502,8 +502,8 @@ public class CompareTableDataIgnorePkTests
 
         // Modify 行の内容確認: jvndb_id=JVN-001
         var mod = modifies[0];
-        Assert.NotNull(mod.SourceRow);
-        Assert.NotNull(mod.TargetRow);
+        Assert.NotNull(mod.SourceValues);
+        Assert.NotNull(mod.TargetValues);
     }
 
     /// <summary>
@@ -542,13 +542,13 @@ public class CompareTableDataIgnorePkTests
         var mod = modifies[0];
 
         // related_item_id はソース=100、ターゲット=200 で異なる → "Ignore"
-        Assert.Equal("Ignore", mod.SourceRow!["related_item_id"]?.ToString());
-        Assert.Equal("Ignore", mod.TargetRow!["related_item_id"]?.ToString());
+        Assert.Equal("Ignore", mod.SourceValues!["related_item_id"]?.ToString());
+        Assert.Equal("Ignore", mod.TargetValues!["related_item_id"]?.ToString());
 
         // Addition: 純粋新規 → 常に "Ignore"
         var additions = entries.Where(e => e.DiffType == DiffType.Addition).ToList();
         Assert.Single(additions);
-        Assert.Equal("Ignore", additions[0].TargetRow!["related_item_id"]?.ToString());
+        Assert.Equal("Ignore", additions[0].TargetValues!["related_item_id"]?.ToString());
     }
 
     /// <summary>
@@ -585,8 +585,8 @@ public class CompareTableDataIgnorePkTests
         var mod = modifies[0];
 
         // related_item_id はソース=100、ターゲット=100 で同一 → 実値 "100" を表示
-        Assert.Equal("100", mod.SourceRow!["related_item_id"]?.ToString());
-        Assert.Equal("100", mod.TargetRow!["related_item_id"]?.ToString());
+        Assert.Equal("100", mod.SourceValues!["related_item_id"]?.ToString());
+        Assert.Equal("100", mod.TargetValues!["related_item_id"]?.ToString());
     }
 
     // ── hvn_cpe テスト用ヘルパー ──
@@ -721,7 +721,7 @@ public class CompareTableDataIgnorePkTests
         return ctx;
     }
 
-    private static async Task<List<RowDiff>> RunHvnCpeCompareAndGetDiffs(
+    private static async Task<List<DiffEntry>> RunHvnCpeCompareAndGetDiffs(
         InMemoryDbContext srcCtx, InMemoryDbContext tgtCtx)
     {
         var settings = new MySqlVerifierSettings
@@ -749,7 +749,7 @@ public class CompareTableDataIgnorePkTests
         Assert.True(result.Success, $"CompareAsync failed: {result.ErrorMessage}\nLogs:\n{string.Join("\n", logger.Messages)}");
 
         var diff = MySqlVerifierDiff.LastInstance;
-        return diff?.Entries ?? new List<RowDiff>();
+        return diff?.Entries ?? new List<DiffEntry>();
     }
 
     /// <summary>
@@ -802,18 +802,18 @@ public class CompareTableDataIgnorePkTests
         // ★ 核心: hvn_id はソース=138869、ターゲット=138869 で同一 → "Ignore" ではなく実値 "138869"
         foreach (var mod in modifies)
         {
-            Assert.NotNull(mod.SourceRow);
-            Assert.NotNull(mod.TargetRow);
+            Assert.NotNull(mod.SourceValues);
+            Assert.NotNull(mod.TargetValues);
 
-            var srcHvnId = mod.SourceRow!["hvn_id"]?.ToString();
-            var tgtHvnId = mod.TargetRow!["hvn_id"]?.ToString();
+            var srcHvnId = mod.SourceValues!["hvn_id"]?.ToString();
+            var tgtHvnId = mod.TargetValues!["hvn_id"]?.ToString();
 
             Assert.Equal("138869", srcHvnId);
             Assert.Equal("138869", tgtHvnId);
 
             // number も同一なら実値を表示すべき
-            var srcNumber = mod.SourceRow!["number"]?.ToString();
-            var tgtNumber = mod.TargetRow!["number"]?.ToString();
+            var srcNumber = mod.SourceValues!["number"]?.ToString();
+            var tgtNumber = mod.TargetValues!["number"]?.ToString();
             Assert.NotEqual("Ignore", srcNumber);
             Assert.NotEqual("Ignore", tgtNumber);
         }
@@ -856,8 +856,8 @@ public class CompareTableDataIgnorePkTests
 
         foreach (var mod in modifies)
         {
-            var srcHvnId = mod.SourceRow!["hvn_id"]?.ToString();
-            var tgtHvnId = mod.TargetRow!["hvn_id"]?.ToString();
+            var srcHvnId = mod.SourceValues!["hvn_id"]?.ToString();
+            var tgtHvnId = mod.TargetValues!["hvn_id"]?.ToString();
 
             // hvn_id は AlternativeKey でマッチしているので必ず同一 → 実値を表示
             Assert.Equal(srcHvnId, tgtHvnId);
@@ -920,8 +920,8 @@ public class CompareTableDataIgnorePkTests
 
         foreach (var mod in modifies)
         {
-            var srcHvnId = mod.SourceRow!["hvn_id"]?.ToString();
-            var tgtHvnId = mod.TargetRow!["hvn_id"]?.ToString();
+            var srcHvnId = mod.SourceValues!["hvn_id"]?.ToString();
+            var tgtHvnId = mod.TargetValues!["hvn_id"]?.ToString();
             // hvn_id は AlternativeKey でマッチ → 必ず同一 → 実値
             Assert.Equal(srcHvnId, tgtHvnId);
             Assert.NotEqual("Ignore", srcHvnId);
@@ -936,7 +936,7 @@ public class CompareTableDataIgnorePkTests
         // Modify エントリの CSV 行で hvn_id が "Ignore" でないことを確認
         foreach (var mod in modifies)
         {
-            var row = mod.SourceRow ?? mod.TargetRow;
+            var row = mod.SourceValues ?? mod.TargetValues;
             Assert.NotNull(row);
             var hvnIdVal = row!["hvn_id"]?.ToString();
             Assert.NotEqual("Ignore", hvnIdVal);
@@ -999,11 +999,11 @@ public class CompareTableDataIgnorePkTests
         // ★ 核心: 全 Modify 行で hvn_id は実値（"Ignore" ではない）
         foreach (var mod in modifies)
         {
-            Assert.NotNull(mod.SourceRow);
-            Assert.NotNull(mod.TargetRow);
+            Assert.NotNull(mod.SourceValues);
+            Assert.NotNull(mod.TargetValues);
 
-            var srcHvnId = mod.SourceRow!["hvn_id"]?.ToString();
-            var tgtHvnId = mod.TargetRow!["hvn_id"]?.ToString();
+            var srcHvnId = mod.SourceValues!["hvn_id"]?.ToString();
+            var tgtHvnId = mod.TargetValues!["hvn_id"]?.ToString();
 
             // AlternativeKey=["hvn_id"] でマッチしているので必ず同一
             Assert.Equal(srcHvnId, tgtHvnId);
@@ -1011,8 +1011,8 @@ public class CompareTableDataIgnorePkTests
             Assert.NotEqual("Ignore", tgtHvnId);
 
             // number も検証: SetPkConditionalIgnore で個別に比較されるため
-            var srcNum = mod.SourceRow!["number"]?.ToString();
-            var tgtNum = mod.TargetRow!["number"]?.ToString();
+            var srcNum = mod.SourceValues!["number"]?.ToString();
+            var tgtNum = mod.TargetValues!["number"]?.ToString();
             // number が同一なら実値、異なるなら "Ignore"
             if (srcNum != "Ignore" && tgtNum != "Ignore")
                 Assert.Equal(srcNum, tgtNum);
