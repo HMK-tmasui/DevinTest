@@ -1029,6 +1029,112 @@ public class CompareTableDataIgnorePkTests
         Assert.Contains("\"hvn_id\"", header);
     }
 
+    /// <summary>
+    /// CSV出力フォーマット検証: Modify行は "oldVal => newVal" 形式で変更差分を出力し、
+    /// PKカラムは条件付きIgnore値、未変更カラムは空文字であること。
+    /// </summary>
+    [Fact]
+    public async Task Modify_CsvFormat_ShouldShowOldNewDiff()
+    {
+        var (columns, primaryKeys) = CreateColumnMetadata();
+        var t1 = new DateTime(2026, 4, 1, 10, 0, 0);
+        var t2 = new DateTime(2026, 4, 10, 15, 0, 0);
+
+        // ソース: vendor_id=1808
+        var srcRows = new List<Dictionary<string, object?>>
+        {
+            MakeRow(100, "JVNDB-2026-006630", "typeA", "advisoryB", 1808, "ProductName", "V001", "http://example.com/info", t1)
+        };
+
+        // ターゲット: 旧データ(t1) + 新データ(t2, vendor_id=9233)
+        var tgtRows = new List<Dictionary<string, object?>>
+        {
+            MakeRow(100, "JVNDB-2026-006630", "typeA", "advisoryB", 1808, "ProductName", "V001", "http://example.com/info", t1),
+            MakeRow(200, "JVNDB-2026-006630", "typeA", "advisoryB", 9233, "ProductName", "V001", "http://example.com/info", t2)
+        };
+
+        var srcCtx = CreateMockContext(srcRows, columns, primaryKeys);
+        var tgtCtx = CreateMockContext(tgtRows, columns, primaryKeys);
+        var entries = await RunCompareAndGetDiffs(srcCtx, tgtCtx);
+
+        // Modify が 1 件であること
+        var modifies = entries.Where(e => e.DiffType == DiffType.Modify).ToList();
+        Assert.Single(modifies);
+
+        var mod = modifies[0];
+        // vendor_id が変更カラムであること
+        Assert.Contains("vendor_id", mod.ChangedColumns);
+
+        // SourceValues/TargetValues に実データが入っていること
+        Assert.Equal(1808, Convert.ToInt32(mod.SourceValues["vendor_id"]));
+        Assert.Equal(9233, Convert.ToInt32(mod.TargetValues["vendor_id"]));
+
+        // BuildCsvLine で出力フォーマットを検証
+        var diff = MySqlVerifierDiff.LastInstance;
+        Assert.NotNull(diff);
+        var csvLines = diff!.BuildCsvLine();
+        Assert.True(csvLines.Count >= 2, "ヘッダー + データ行が必要");
+
+        // データ行（index 1）を検証
+        var dataLine = csvLines[1];
+        // Modify 行であること
+        Assert.Contains("\"Modify\"", dataLine);
+        // vendor_id の変更差分が "1808 => 9233" 形式であること
+        Assert.Contains("1808 => 9233", dataLine);
+        // related_item_id（PK）は条件付き Ignore: ソース=100, ターゲット=200 → "Ignore"
+        Assert.Contains("\"Ignore\"", dataLine);
+    }
+
+    /// <summary>
+    /// CSV出力フォーマット検証（PK同値）: Modify行でPK値が同一の場合、実値を表示。
+    /// </summary>
+    [Fact]
+    public async Task Modify_CsvFormat_SamePk_ShouldShowActualPkValue()
+    {
+        var (columns, primaryKeys) = CreateColumnMetadata();
+        var t1 = new DateTime(2026, 4, 1, 10, 0, 0);
+        var t2 = new DateTime(2026, 4, 10, 15, 0, 0);
+
+        // ソース: related_item_id=100, vendor_id=1808
+        var srcRows = new List<Dictionary<string, object?>>
+        {
+            MakeRow(100, "JVNDB-2026-006630", "typeA", "advisoryB", 1808, "ProductName", "V001", "http://example.com/info", t1)
+        };
+
+        // ターゲット: related_item_id=100（同一PK）, vendor_id=9233
+        var tgtRows = new List<Dictionary<string, object?>>
+        {
+            MakeRow(100, "JVNDB-2026-006630", "typeA", "advisoryB", 1808, "ProductName", "V001", "http://example.com/info", t1),
+            MakeRow(100, "JVNDB-2026-006630", "typeA", "advisoryB", 9233, "ProductName", "V001", "http://example.com/info", t2)
+        };
+
+        var srcCtx = CreateMockContext(srcRows, columns, primaryKeys);
+        var tgtCtx = CreateMockContext(tgtRows, columns, primaryKeys);
+        var entries = await RunCompareAndGetDiffs(srcCtx, tgtCtx);
+
+        var modifies = entries.Where(e => e.DiffType == DiffType.Modify).ToList();
+        Assert.Single(modifies);
+
+        var mod = modifies[0];
+        // related_item_id はソース=100, ターゲット=100 で同一 → 実値 "100"
+        Assert.Equal("100", mod.SourceValues["related_item_id"]?.ToString());
+        Assert.Equal("100", mod.TargetValues["related_item_id"]?.ToString());
+
+        // BuildCsvLine 出力検証
+        var diff = MySqlVerifierDiff.LastInstance;
+        Assert.NotNull(diff);
+        var csvLines = diff!.BuildCsvLine();
+        Assert.True(csvLines.Count >= 2);
+
+        var dataLine = csvLines[1];
+        Assert.Contains("\"Modify\"", dataLine);
+        // vendor_id 差分
+        Assert.Contains("1808 => 9233", dataLine);
+        // PK 同値 → "100" が CSV に含まれる（"Ignore" ではない）
+        Assert.Contains("\"100\"", dataLine);
+        Assert.DoesNotContain("\"Ignore\"", dataLine);
+    }
+
     private static InMemoryDbContext CreateForcePkMockContext(
         List<Dictionary<string, object?>> tableRows,
         List<ColumnInfo> columns,

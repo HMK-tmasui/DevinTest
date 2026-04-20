@@ -1133,28 +1133,17 @@ public class MySqlVerifierService
 		return sb.ToString();
 	}
 
-	/// <summary>CSV 1セルのフォーマット: null → NULL、DateTime → yyyy-MM-dd HH:mm:ss、その他 → "値"</summary>
-	private static string FormatCsvCell(object? val)
-	{
-		if (val == null) return "NULL";
-		if (val is DateTime dt) return $"\"{dt:yyyy-MM-dd HH:mm:ss}\"";
-		var s = val.ToString() ?? "";
-		return $"\"{s.Replace("\"", "\"\"")}\"";
-	}
-
-	/// <summary>行の CSV 文字列を生成</summary>
-	private static string BuildCsvRow(string diffType, Dictionary<string, object?> row, List<string> columns)
-	{
-		var sb = new StringBuilder(columns.Count * 16);
-		sb.Append($"\"{diffType}\"");
-		foreach (var col in columns)
-		{
-			sb.Append(',');
-			sb.Append(FormatCsvCell(row.GetValueOrDefault(col)));
-		}
-		return sb.ToString();
-	}
-
+	/// <summary>
+	/// diff.Entries から直接 CSV 行を生成する。
+	/// BuildCsvLine() を経由しないため、SetPkConditionalIgnore で設定した条件付き Ignore 値がそのまま出力される。
+	///
+	/// 出力フォーマット（実 RowDiff.BuildCsvLine() と同一）:
+	///   Modify  + ChangedColumn → "oldVal => newVal"
+	///   Modify  + FixedColumn(PK) → 実値（条件付き Ignore 適用済み）
+	///   Modify  + 未変更カラム → ""
+	///   Delete  → ソース値
+	///   Addition → ターゲット値
+	/// </summary>
 	private async Task WriteDiffCsvAsync(
 		string tableName,
 		MySqlVerifierDiff diff,
@@ -1169,8 +1158,11 @@ public class MySqlVerifierService
 			: pkColumns.Count > 0 ? $"_PK({string.Join(",", pkColumns)})" : "_NoPK";
 		var baseFileName = $"{tableName}_diff_{timestamp}{pkSuffix}";
 
-		// ヘッダー行: "diff_type","col1","col2",...
-		var headerLine = "\"diff_type\"," + string.Join(",", allColumns.Select(c => $"\"{c}\""));
+		// 固定カラム（PK）セット
+		var fixedColumnSet = new HashSet<string>(pkColumns, StringComparer.OrdinalIgnoreCase);
+
+		// ヘッダー行: "DiffType","col1","col2",...
+		var headerLine = string.Join(",", new[] { "DiffType" }.Concat(allColumns));
 		var headerBytes = Encoding.UTF8.GetByteCount(headerLine + Environment.NewLine);
 
 		// diff.Entries から直接 CSV 行を生成（BuildCsvLine を経由しない）
@@ -1178,30 +1170,21 @@ public class MySqlVerifierService
 		var lines = new List<string>();
 		foreach (var entry in diff.Entries)
 		{
-			var diffLabel = entry.DiffType switch
+			var cells = allColumns.Select(col => entry.DiffType switch
 			{
-				DiffType.Delete => "Delete",
-				DiffType.Addition => "Addition",
-				DiffType.Modify => "Modify",
-				_ => "Unknown"
-			};
+				DiffType.Modify when entry.ChangedColumns.Contains(col)
+					=> $"{RowDiff.FormatCsvValue(entry.SourceValues.GetValueOrDefault(col))} => {RowDiff.FormatCsvValue(entry.TargetValues.GetValueOrDefault(col))}",
+				DiffType.Modify when fixedColumnSet.Contains(col)
+					=> RowDiff.FormatCsvValue(entry.SourceValues.GetValueOrDefault(col)),
+				DiffType.Modify   => "",
+				DiffType.Delete   => RowDiff.FormatCsvValue(entry.SourceValues.GetValueOrDefault(col)),
+				DiffType.Addition => RowDiff.FormatCsvValue(entry.TargetValues.GetValueOrDefault(col)),
+				_ => ""
+			});
 
-			if (entry.DiffType == DiffType.Modify)
-			{
-				// Modify: ソース行とターゲット行の両方を出力
-				if (entry.SourceValues.Count > 0)
-					lines.Add(BuildCsvRow(diffLabel, entry.SourceValues, allColumns));
-				if (entry.TargetValues.Count > 0)
-					lines.Add(BuildCsvRow(diffLabel, entry.TargetValues, allColumns));
-			}
-			else if (entry.DiffType == DiffType.Delete && entry.SourceValues.Count > 0)
-			{
-				lines.Add(BuildCsvRow(diffLabel, entry.SourceValues, allColumns));
-			}
-			else if (entry.DiffType == DiffType.Addition && entry.TargetValues.Count > 0)
-			{
-				lines.Add(BuildCsvRow(diffLabel, entry.TargetValues, allColumns));
-			}
+			lines.Add(string.Join(",",
+				new[] { entry.DiffType.ToString() }.Concat(cells)
+					.Select(v => $"\"{(v ?? "").Replace("\"", "\"\"")}\"")));
 		}
 
 		if (lines.Count == 0) return;

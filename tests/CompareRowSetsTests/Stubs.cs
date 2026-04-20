@@ -190,13 +190,24 @@ namespace HscTool.Shared.Diff
 
         public virtual List<string> BuildCsvLine()
         {
-            var lines = new List<string> { string.Join(",", AllColumns.Select(c => $"\"{c}\"")) };
+            var lines = new List<string> { string.Join(",", new[] { "\"DiffType\"" }.Concat(AllColumns.Select(c => $"\"{c}\""))) };
             foreach (var entry in Entries)
             {
-                var row = entry.SourceValues.Count > 0 ? entry.SourceValues : entry.TargetValues;
-                if (row.Count == 0) continue;
-                lines.Add(string.Join(",", AllColumns.Select(c =>
-                    $"\"{FormatCsvValue(row.GetValueOrDefault(c))}\"")));
+                var cells = AllColumns.Select(col => entry.DiffType switch
+                {
+                    DiffType.Modify when entry.ChangedColumns.Contains(col)
+                        => $"{FormatCsvValue(entry.SourceValues.GetValueOrDefault(col))} => {FormatCsvValue(entry.TargetValues.GetValueOrDefault(col))}",
+                    DiffType.Modify when FixedColumnSet != null && FixedColumnSet.Contains(col)
+                        => FormatCsvValue(entry.SourceValues.GetValueOrDefault(col)),
+                    DiffType.Modify => "",
+                    DiffType.Delete => FormatCsvValue(entry.SourceValues.GetValueOrDefault(col)),
+                    DiffType.Addition => FormatCsvValue(entry.TargetValues.GetValueOrDefault(col)),
+                    _ => ""
+                });
+
+                lines.Add(string.Join(",",
+                    new[] { entry.DiffType.ToString() }.Concat(cells)
+                        .Select(v => $"\"{(v ?? "").Replace("\"", "\"\"")}\"")));
             }
             return lines;
         }
