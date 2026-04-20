@@ -158,36 +158,59 @@ namespace HscTool.Shared.Diff
 {
     public enum DiffType { Delete, Addition, Modify }
 
-    public class DiffEntry
+    /// <summary>
+    /// IRowDiff の非ジェネリック抽象基底クラス（実 HSCTOOL の RowDiff に対応）。
+    /// DiffEntry ベースの差分管理・CSV 出力ロジックを統合。
+    /// </summary>
+    public abstract class RowDiff
     {
-        public DiffType DiffType { get; init; }
-        public Dictionary<string, object?> SourceValues { get; init; } = new(StringComparer.OrdinalIgnoreCase);
-        public Dictionary<string, object?> TargetValues { get; init; } = new(StringComparer.OrdinalIgnoreCase);
-        public HashSet<string> ChangedColumns { get; init; } = new(StringComparer.OrdinalIgnoreCase);
-
-        public static string FormatCsvValue(object? val)
+        /// <summary>1行分の差分データ</summary>
+        public class DiffEntry
         {
-            if (val == null) return "";
-            if (val is DateTime dt) return dt.ToString("yyyy-MM-dd HH:mm:ss");
-            return val.ToString() ?? "";
+            public DiffType DiffType { get; init; }
+            public Dictionary<string, object?> SourceValues { get; init; } = new(StringComparer.OrdinalIgnoreCase);
+            public Dictionary<string, object?> TargetValues { get; init; } = new(StringComparer.OrdinalIgnoreCase);
+            public HashSet<string> ChangedColumns { get; init; } = new(StringComparer.OrdinalIgnoreCase);
         }
-    }
 
-    public class MySqlVerifierDiff
-    {
-        private List<string> _allColumns = new();
-        private string[]? _pkColumns;
-
-        /// <summary>テスト用: 最後に Init された diff インスタンスを保持</summary>
-        public static MySqlVerifierDiff? LastInstance { get; set; }
+        protected List<string> AllColumns { get; set; } = new();
+        protected HashSet<string>? FixedColumnSet;
 
         public List<DiffEntry> Entries { get; } = new();
         public int DiffCount => Entries.Count;
 
+        /// <summary>CSV形式の値フォーマット（DateTime/TimeSpan 対応）</summary>
+        public static string FormatCsvValue(object? value)
+        {
+            if (value == null) return "";
+            if (value is DateTime dt) return dt.ToString("yyyy-MM-dd HH:mm:ss", System.Globalization.CultureInfo.InvariantCulture);
+            if (value is TimeSpan ts) return ts.ToString(@"hh\:mm\:ss");
+            return value.ToString() ?? "";
+        }
+
+        public virtual List<string> BuildCsvLine()
+        {
+            var lines = new List<string> { string.Join(",", AllColumns.Select(c => $"\"{c}\"")) };
+            foreach (var entry in Entries)
+            {
+                var row = entry.SourceValues.Count > 0 ? entry.SourceValues : entry.TargetValues;
+                if (row.Count == 0) continue;
+                lines.Add(string.Join(",", AllColumns.Select(c =>
+                    $"\"{FormatCsvValue(row.GetValueOrDefault(c))}\"")));
+            }
+            return lines;
+        }
+    }
+
+    public class MySqlVerifierDiff : RowDiff
+    {
+        /// <summary>テスト用: 最後に Init された diff インスタンスを保持</summary>
+        public static MySqlVerifierDiff? LastInstance { get; set; }
+
         public void Init(List<string> allColumns, string[]? pkColumns)
         {
-            _allColumns = allColumns;
-            _pkColumns = pkColumns;
+            AllColumns = allColumns;
+            FixedColumnSet = pkColumns != null ? new HashSet<string>(pkColumns, StringComparer.OrdinalIgnoreCase) : null;
             LastInstance = this;
         }
 
@@ -212,20 +235,6 @@ namespace HscTool.Shared.Diff
                 TargetValues = targetRow ?? new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase),
                 ChangedColumns = new HashSet<string>(diffCols, StringComparer.OrdinalIgnoreCase)
             });
-        }
-
-        public List<string> BuildCsvLine()
-        {
-            var lines = new List<string>();
-            lines.Add(string.Join(",", _allColumns.Select(c => $"\"{c}\"")));
-            foreach (var entry in Entries)
-            {
-                var row = entry.SourceValues.Count > 0 ? entry.SourceValues : entry.TargetValues;
-                if (row.Count == 0) continue;
-                lines.Add(string.Join(",", _allColumns.Select(c =>
-                    $"\"{DiffEntry.FormatCsvValue(row.GetValueOrDefault(c))}\"")));
-            }
-            return lines;
         }
     }
 }

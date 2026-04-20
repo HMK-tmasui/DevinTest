@@ -9,6 +9,7 @@ using System.Linq;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using Xunit;
+using DiffEntry = HscTool.Shared.Diff.RowDiff.DiffEntry;
 
 namespace CompareRowSetsTests;
 

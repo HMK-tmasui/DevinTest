@@ -981,7 +981,7 @@ public class MySqlVerifierService
 			for (int i = 0; i < allColumns.Count; i++)
 			{
 				if (i > 0) sb.Append("|");
-				sb.Append(DiffEntry.FormatCsvValue(row.GetValueOrDefault(allColumns[i])));
+				sb.Append(RowDiff.FormatCsvValue(row.GetValueOrDefault(allColumns[i])));
 			}
 			AddToList(multiset, sb.ToString(), row);
 		}
