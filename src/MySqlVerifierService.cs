@@ -624,8 +624,9 @@ public class MySqlVerifierService
 					{
 									var srcRow = srcCandidates[0];
 						srcCandidates.RemoveAt(0);
-							StoreOriginalPks(_modifyOriginalPks, diff, srcRow, finalTgtOnly[i], ignorePkColumns);
+								var origPks1 = CaptureOriginalPks(srcRow, finalTgtOnly[i], ignorePkColumns);
 								diff.AddEntry(DiffType.Modify, pkColumns, srcRow, finalTgtOnly[i], nonPkCompareColumns);
+								_modifyOriginalPks[diff.Entries.Count - 1] = origPks1;
 						resolved.Add(i);
 					}
 				}
@@ -660,8 +661,9 @@ public class MySqlVerifierService
 					{
 									var tgtRow = tgtCandidates[0];
 						tgtCandidates.RemoveAt(0);
-							StoreOriginalPks(_modifyOriginalPks, diff, finalSrcOnly[i], tgtRow, ignorePkColumns);
+								var origPks2 = CaptureOriginalPks(finalSrcOnly[i], tgtRow, ignorePkColumns);
 							diff.AddEntry(DiffType.Modify, pkColumns, finalSrcOnly[i], tgtRow, nonPkCompareColumns);
+							_modifyOriginalPks[diff.Entries.Count - 1] = origPks2;
 						resolved.Add(i);
 					}
 				}
@@ -786,9 +788,12 @@ public class MySqlVerifierService
 			{
 					pairedSrc.Add(srcIndices[i]);
 				pairedTgt.Add(tgtIndices[i]);
-				if (modifyOriginalPks != null)
-					StoreOriginalPks(modifyOriginalPks, diff, unmatchedSrc[srcIndices[i]], unmatchedTgt[tgtIndices[i]], setPkIgnoreCols);
+				var origPks = modifyOriginalPks != null
+					? CaptureOriginalPks(unmatchedSrc[srcIndices[i]], unmatchedTgt[tgtIndices[i]], setPkIgnoreCols)
+					: null;
 				diff.AddEntry(DiffType.Modify, pkColumns, unmatchedSrc[srcIndices[i]], unmatchedTgt[tgtIndices[i]], nonPkCompareColumns);
+				if (origPks != null)
+					modifyOriginalPks![diff.Entries.Count - 1] = origPks;
 			}
 		}
 
@@ -817,20 +822,17 @@ public class MySqlVerifierService
 	}
 
 	/// <summary>
-	/// Modify 行の AddEntry 呼び出し前に、元の PK 値を退避する。
-	/// diff.Entries.Count を使って、これから追加されるエントリのインデックスを取得する。
+	/// AddEntry 呼び出し前に PK 値をキャプチャする。
+	/// AddEntry が元の行辞書を変更する可能性があるため、先に値を取得する。
 	/// </summary>
-	private static void StoreOriginalPks(
-		Dictionary<int, Dictionary<string, (object? src, object? tgt)>> store,
-		MySqlVerifierDiff diff,
+	private static Dictionary<string, (object? src, object? tgt)> CaptureOriginalPks(
 		Dictionary<string, object?> srcRow, Dictionary<string, object?> tgtRow,
 		List<string> pkColumns)
 	{
-		var entryIndex = diff.Entries.Count;
 		var pkVals = new Dictionary<string, (object? src, object? tgt)>(pkColumns.Count, StringComparer.OrdinalIgnoreCase);
 		foreach (var pk in pkColumns)
 			pkVals[pk] = (srcRow.GetValueOrDefault(pk), tgtRow.GetValueOrDefault(pk));
-		store[entryIndex] = pkVals;
+		return pkVals;
 	}
 
 	private string BuildGroupHashSqlIgnorePk(
