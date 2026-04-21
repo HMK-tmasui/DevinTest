@@ -279,36 +279,30 @@ namespace HscTool.Shared.Diff
             Dictionary<string, object?>? sourceRow, Dictionary<string, object?>? targetRow,
             List<string> compareColumns)
         {
-            var diffCols = new List<string>();
-            if (diffType == DiffType.Modify && sourceRow != null && targetRow != null)
-            {
-                foreach (var col in compareColumns)
-                {
-                    var srcVal = sourceRow.GetValueOrDefault(col)?.ToString() ?? "";
-                    var tgtVal = targetRow.GetValueOrDefault(col)?.ToString() ?? "";
-                    if (srcVal != tgtVal) diffCols.Add(col);
-                }
-            }
-
-            // 実 HSCTOOL の AddEntry と同じ動作: PK 値を "Ignore" に上書きする
-            var srcVals = sourceRow != null
+            // 実 HSCTOOL の AddEntry と完全に同じ動作に合わせる
+            var src = sourceRow != null
                 ? new Dictionary<string, object?>(sourceRow, StringComparer.OrdinalIgnoreCase)
                 : new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
-            var tgtVals = targetRow != null
+            var tgt = targetRow != null
                 ? new Dictionary<string, object?>(targetRow, StringComparer.OrdinalIgnoreCase)
                 : new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
-            foreach (var pk in pkColumns)
+
+            var changed = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var allCols = pkColumns.Concat(compareColumns).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+            foreach (var col in allCols)
             {
-                if (srcVals.ContainsKey(pk)) srcVals[pk] = "Ignore";
-                if (tgtVals.ContainsKey(pk)) tgtVals[pk] = "Ignore";
+                var bVal = src.GetValueOrDefault(col);
+                var aVal = tgt.GetValueOrDefault(col);
+                if (!Equals(bVal, aVal))
+                    changed.Add(col);
             }
 
             Entries.Add(new DiffEntry
             {
                 DiffType = diffType,
-                SourceValues = srcVals,
-                TargetValues = tgtVals,
-                ChangedColumns = new HashSet<string>(diffCols, StringComparer.OrdinalIgnoreCase)
+                SourceValues = src,
+                TargetValues = tgt,
+                ChangedColumns = changed
             });
         }
     }
