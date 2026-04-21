@@ -1194,13 +1194,10 @@ public class MySqlVerifierService
 			var entry = diff.Entries[entryIdx];
 			var cells = allColumns.Select(col =>
 			{
-				if (entry.DiffType == DiffType.Modify)
-				{
-					if (entry.ChangedColumns.Contains(col))
-						return $"{RowDiff.FormatCsvValue(entry.SourceValues.GetValueOrDefault(col))} => {RowDiff.FormatCsvValue(entry.TargetValues.GetValueOrDefault(col))}";
-					if (fixedColumnSet.Contains(col))
+					if (entry.DiffType == DiffType.Modify)
 					{
-						// IgnorePK モード: _modifyOriginalPks から元の PK 値を取得し条件付き Ignore を適用
+						// IgnorePK モード: PK カラムは ChangedColumns より先に条件付き Ignore を適用
+						// （AddEntry に元の PK 値を渡すため、PK が ChangedColumns に含まれる場合がある）
 						if (ignorePk && ignorePkSet.Contains(col)
 							&& _modifyOriginalPks.TryGetValue(entryIdx, out var origPks)
 							&& origPks.TryGetValue(col, out var pkPair))
@@ -1211,10 +1208,12 @@ public class MySqlVerifierService
 								? RowDiff.FormatCsvValue(pkPair.src)
 								: "Ignore";
 						}
-						return RowDiff.FormatCsvValue(entry.SourceValues.GetValueOrDefault(col));
+						if (entry.ChangedColumns.Contains(col))
+							return $"{RowDiff.FormatCsvValue(entry.SourceValues.GetValueOrDefault(col))} => {RowDiff.FormatCsvValue(entry.TargetValues.GetValueOrDefault(col))}";
+						if (fixedColumnSet.Contains(col))
+							return RowDiff.FormatCsvValue(entry.SourceValues.GetValueOrDefault(col));
+						return "";
 					}
-					return "";
-				}
 				if (entry.DiffType == DiffType.Delete)
 				{
 					// IgnorePK の PK カラムは常に "Ignore"
