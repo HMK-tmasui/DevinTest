@@ -529,9 +529,15 @@ public class MySqlVerifierService
 
 		var nonPkCompareColumns = compareColumns
 			.Where(c => !pkColumns.Contains(c, StringComparer.OrdinalIgnoreCase)).ToList();
-		var fetchColumns = pkColumns.Concat(nonPkCompareColumns).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
-		if (!fetchColumns.Contains(dateTimeKey, StringComparer.OrdinalIgnoreCase))
-			fetchColumns.Add(dateTimeKey);
+			var fetchColumns = pkColumns.Concat(nonPkCompareColumns).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+			// alternativeKey カラムが fetchColumns に含まれていない場合は追加（マッチングに必要）
+			foreach (var akCol in alternativeKey)
+			{
+				if (!fetchColumns.Contains(akCol, StringComparer.OrdinalIgnoreCase))
+					fetchColumns.Add(akCol);
+			}
+			if (!fetchColumns.Contains(dateTimeKey, StringComparer.OrdinalIgnoreCase))
+				fetchColumns.Add(dateTimeKey);
 
 		// deleted/added/modified の行を並列フェッチ
 		var srcDeletedTask = deletedKeys.Count > 0
