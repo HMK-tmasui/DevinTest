@@ -1,0 +1,374 @@
+// Minimal stubs for external dependencies used by MySqlVerifierService
+using System;
+using System.Collections.Generic;
+using System.Data;
+using System.Data.Common;
+using System.Linq;
+using System.Threading.Tasks;
+using MySqlConnector;
+
+namespace HscTool.Diagnostics
+{
+    public interface ILogger
+    {
+        void LogInfo(string message);
+        void LogDebug(string message);
+        void LogWarning(string message);
+        void LogError(string message);
+        void NewLine();
+    }
+
+    public class TestLogger : ILogger
+    {
+        public List<string> Messages { get; } = new();
+        public void LogInfo(string message) => Messages.Add($"[INFO] {message}");
+        public void LogDebug(string message) => Messages.Add($"[DEBUG] {message}");
+        public void LogWarning(string message) => Messages.Add($"[WARN] {message}");
+        public void LogError(string message) => Messages.Add($"[ERROR] {message}");
+        public void NewLine() { }
+    }
+}
+
+namespace HscTool.Shared
+{
+    public static class ToolSet
+    {
+        public static string GetCurrentMethod() => "TestMethod";
+    }
+
+    public class DbConnectionHelper : IDisposable, IAsyncDisposable
+    {
+        private readonly HscTool.Diagnostics.ILogger _logger;
+        private readonly IDbContext _context;
+
+        public DbConnectionHelper(HscTool.Diagnostics.ILogger logger, IDbContext context)
+        {
+            _logger = logger;
+            _context = context;
+        }
+
+        public DbCommandWrapper CreateCommand() => new(_context);
+        public static void AddParameter(DbCommandWrapper cmd, string name, object value)
+        {
+            cmd.Parameters[name] = value;
+        }
+        public void Dispose() { }
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+
+    public class DbCommandWrapper : IDisposable
+    {
+        private readonly IDbContext _context;
+        public int CommandTimeout { get; set; }
+        internal Dictionary<string, object> Parameters { get; } = new();
+
+        public DbCommandWrapper(IDbContext context) { _context = context; }
+
+        public Task<DbReaderWrapper> ExecuteReaderAsync(string sql)
+        {
+            // Substitute parameters in SQL
+            foreach (var p in Parameters)
+                sql = sql.Replace(p.Key, $"'{p.Value}'");
+            return Task.FromResult(new DbReaderWrapper(_context.ExecuteQuery(sql)));
+        }
+
+        public void Dispose() { }
+    }
+
+    public class DbReaderWrapper : IDisposable
+    {
+        private readonly List<Dictionary<string, object?>> _rows;
+        private int _currentIndex = -1;
+
+        public DbReaderWrapper(List<Dictionary<string, object?>> rows) { _rows = rows; }
+
+        public int FieldCount => _rows.Count > 0 && _currentIndex >= 0 ? _rows[_currentIndex].Count : 0;
+
+        public Task<bool> ReadAsync()
+        {
+            _currentIndex++;
+            return Task.FromResult(_currentIndex < _rows.Count);
+        }
+
+        public string GetName(int ordinal)
+        {
+            if (_currentIndex < 0 || _currentIndex >= _rows.Count) return "";
+            return _rows[_currentIndex].Keys.ElementAt(ordinal);
+        }
+
+        public int GetOrdinal(string name)
+        {
+            if (_currentIndex < 0 || _currentIndex >= _rows.Count) return -1;
+            var keys = _rows[_currentIndex].Keys.ToList();
+            return keys.FindIndex(k => string.Equals(k, name, StringComparison.OrdinalIgnoreCase));
+        }
+
+        public bool IsDBNull(int ordinal)
+        {
+            if (_currentIndex < 0 || _currentIndex >= _rows.Count) return true;
+            var val = _rows[_currentIndex].Values.ElementAt(ordinal);
+            return val == null;
+        }
+
+        public object? GetValue(int ordinal)
+        {
+            if (_currentIndex < 0 || _currentIndex >= _rows.Count) return null;
+            return _rows[_currentIndex].Values.ElementAt(ordinal);
+        }
+
+        public object? this[string name]
+        {
+            get
+            {
+                if (_currentIndex < 0 || _currentIndex >= _rows.Count) return null;
+                return _rows[_currentIndex].TryGetValue(name, out var val) ? val : null;
+            }
+        }
+
+        public object? this[int ordinal] => GetValue(ordinal);
+
+        public void Dispose() { }
+    }
+
+    public interface IDbContext : IAsyncDisposable
+    {
+        List<Dictionary<string, object?>> ExecuteQuery(string sql);
+    }
+
+    public interface IDbContextFactory
+    {
+        IDbContext CreateContext();
+    }
+
+    public class MySqlDbContextFactory : IDbContextFactory
+    {
+        private readonly HscTool.Model.Json.MySQL _config;
+        public MySqlDbContextFactory(HscTool.Model.Json.MySQL config) { _config = config; }
+        public IDbContext CreateContext()
+        {
+            if (!string.IsNullOrEmpty(_config.Server))
+                return new RealMySqlDbContext(_config.ToConnectionString());
+            return new InMemoryDbContext();
+        }
+    }
+
+    /// <summary>Real MySQL database context using MySqlConnector</summary>
+    public class RealMySqlDbContext : IDbContext
+    {
+        private readonly string _connectionString;
+
+        public RealMySqlDbContext(string connectionString)
+        {
+            _connectionString = connectionString;
+        }
+
+        public List<Dictionary<string, object?>> ExecuteQuery(string sql)
+        {
+            using var conn = new MySqlConnection(_connectionString);
+            conn.Open();
+            using var cmd = new MySqlCommand(sql, conn);
+            cmd.CommandTimeout = 300;
+            using var reader = cmd.ExecuteReader();
+
+            var results = new List<Dictionary<string, object?>>();
+            while (reader.Read())
+            {
+                var row = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
+                for (int i = 0; i < reader.FieldCount; i++)
+                {
+                    row[reader.GetName(i)] = reader.IsDBNull(i) ? null : reader.GetValue(i);
+                }
+                results.Add(row);
+            }
+            return results;
+        }
+
+        public ValueTask DisposeAsync()
+        {
+            return ValueTask.CompletedTask;
+        }
+    }
+
+    public class InMemoryDbContext : IDbContext
+    {
+        public Dictionary<string, List<Dictionary<string, object?>>> Tables { get; } = new();
+        public Func<string, List<Dictionary<string, object?>>>? QueryHandler { get; set; }
+
+        public List<Dictionary<string, object?>> ExecuteQuery(string sql)
+        {
+            if (QueryHandler != null) return QueryHandler(sql);
+            return new List<Dictionary<string, object?>>();
+        }
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+}
+
+namespace HscTool.Shared.Diff
+{
+    public enum DiffType { Delete, Addition, Modify }
+
+    /// <summary>
+    /// IRowDiff の非ジェネリック抽象基底クラス（実 HSCTOOL の RowDiff に対応）。
+    /// DiffEntry ベースの差分管理・CSV 出力ロジックを統合。
+    /// </summary>
+    public abstract class RowDiff
+    {
+        /// <summary>1行分の差分データ</summary>
+        public class DiffEntry
+        {
+            public DiffType DiffType { get; init; }
+            public Dictionary<string, object?> SourceValues { get; init; } = new(StringComparer.OrdinalIgnoreCase);
+            public Dictionary<string, object?> TargetValues { get; init; } = new(StringComparer.OrdinalIgnoreCase);
+            public HashSet<string> ChangedColumns { get; init; } = new(StringComparer.OrdinalIgnoreCase);
+        }
+
+        protected List<string> AllColumns { get; set; } = new();
+        protected HashSet<string>? FixedColumnSet;
+
+        public List<DiffEntry> Entries { get; } = new();
+        public int DiffCount => Entries.Count;
+
+        /// <summary>CSV形式の値フォーマット（DateTime/TimeSpan 対応）</summary>
+        public static string FormatCsvValue(object? value)
+        {
+            if (value == null) return "";
+            if (value is DateTime dt) return dt.ToString("yyyy-MM-dd HH:mm:ss", System.Globalization.CultureInfo.InvariantCulture);
+            if (value is TimeSpan ts) return ts.ToString(@"hh\:mm\:ss");
+            return value.ToString() ?? "";
+        }
+
+        public virtual List<string> BuildCsvLine()
+        {
+            var lines = new List<string> { string.Join(",", new[] { "\"DiffType\"" }.Concat(AllColumns.Select(c => $"\"{c}\""))) };
+            foreach (var entry in Entries)
+            {
+                var cells = AllColumns.Select(col => entry.DiffType switch
+                {
+                    DiffType.Modify when entry.ChangedColumns.Contains(col)
+                        => $"{FormatCsvValue(entry.SourceValues.GetValueOrDefault(col))} => {FormatCsvValue(entry.TargetValues.GetValueOrDefault(col))}",
+                    DiffType.Modify when FixedColumnSet != null && FixedColumnSet.Contains(col)
+                        => FormatCsvValue(entry.SourceValues.GetValueOrDefault(col)),
+                    DiffType.Modify => "",
+                    DiffType.Delete => FormatCsvValue(entry.SourceValues.GetValueOrDefault(col)),
+                    DiffType.Addition => FormatCsvValue(entry.TargetValues.GetValueOrDefault(col)),
+                    _ => ""
+                });
+
+                lines.Add(string.Join(",",
+                    new[] { entry.DiffType.ToString() }.Concat(cells)
+                        .Select(v => $"\"{(v ?? "").Replace("\"", "\"\"")}\"")));
+            }
+            return lines;
+        }
+    }
+
+    public class MySqlVerifierDiff : RowDiff
+    {
+        /// <summary>テスト用: 最後に Init された diff インスタンスを保持</summary>
+        public static MySqlVerifierDiff? LastInstance { get; set; }
+
+        public void Init(List<string> allColumns, string[]? pkColumns)
+        {
+            AllColumns = allColumns;
+            FixedColumnSet = pkColumns != null ? new HashSet<string>(pkColumns, StringComparer.OrdinalIgnoreCase) : null;
+            LastInstance = this;
+        }
+
+        public void AddEntry(DiffType diffType, List<string> pkColumns,
+            Dictionary<string, object?>? sourceRow, Dictionary<string, object?>? targetRow,
+            List<string> compareColumns)
+        {
+            // 実 HSCTOOL の AddEntry と完全に同じ動作に合わせる
+            var src = sourceRow != null
+                ? new Dictionary<string, object?>(sourceRow, StringComparer.OrdinalIgnoreCase)
+                : new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
+            var tgt = targetRow != null
+                ? new Dictionary<string, object?>(targetRow, StringComparer.OrdinalIgnoreCase)
+                : new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
+
+            var changed = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var allCols = pkColumns.Concat(compareColumns).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+            foreach (var col in allCols)
+            {
+                var bVal = src.GetValueOrDefault(col);
+                var aVal = tgt.GetValueOrDefault(col);
+                if (!Equals(bVal, aVal))
+                    changed.Add(col);
+            }
+
+            Entries.Add(new DiffEntry
+            {
+                DiffType = diffType,
+                SourceValues = src,
+                TargetValues = tgt,
+                ChangedColumns = changed
+            });
+        }
+    }
+}
+
+namespace HscTool.Model.Json
+{
+    public class MySQL
+    {
+        public string Database { get; set; } = "";
+        public string Server { get; set; } = "";
+        public int Port { get; set; } = 3306;
+        public string User { get; set; } = "";
+        public string Password { get; set; } = "";
+
+        public string ToConnectionString() =>
+            $"Server={Server};Port={Port};Database={Database};User={User};Password={Password};SslMode=None;AllowPublicKeyRetrieval=true;";
+    }
+}
+
+namespace HscTool.Shared.Json
+{
+    public class JsonSettingLoader<T> where T : new() 
+    {
+        protected static T CreateInstance(object logger, string file) => new();
+    }
+}
+
+namespace HvnDbVerifier
+{
+    public class HvnDbVerifierLogger
+    {
+        public static HscTool.Diagnostics.ILogger Instance { get; } = new HscTool.Diagnostics.TestLogger();
+    }
+
+    public class MySqlVerifierResult
+    {
+        public bool Success { get; set; }
+        public string ErrorMessage { get; set; } = "";
+        public List<string> MissingInTarget { get; set; } = new();
+        public List<string> MissingInSource { get; set; } = new();
+        public List<string> PrimaryKeyMismatch { get; set; } = new();
+        public List<string> NoPrimaryKey { get; set; } = new();
+        public Dictionary<string, int> TableDiffs { get; set; } = new();
+    }
+
+    public class ColumnInfo
+    {
+        public string ColumnName { get; set; } = "";
+        public string DataType { get; set; } = "";
+        public bool IsNullable { get; set; }
+        public string ColumnType { get; set; } = "";
+        public bool IsPrimaryKey { get; set; }
+        public int PrimaryKeyOrdinal { get; set; }
+    }
+
+    public class MySqlVerifierMetadata
+    {
+        public string TableName { get; set; } = "";
+        public List<ColumnInfo> Columns { get; set; } = new();
+        public List<ColumnInfo> PrimaryKeys { get; set; } = new();
+
+        public List<string> GetPrimaryKeyNames() => PrimaryKeys.Select(c => c.ColumnName).ToList();
+        public List<ColumnInfo> GetCompareColumns() =>
+            Columns.Where(c => !PrimaryKeys.Any(pk => pk.ColumnName == c.ColumnName)).ToList();
+    }
+}
+
+// FrozenSet is provided by .NET 8 System.Collections.Frozen — no stub needed
