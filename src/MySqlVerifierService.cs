@@ -28,7 +28,7 @@ public class MySqlVerifierService
 
 	/// <summary>
 	/// Modify エントリの元の PK 値を保持。
-	/// 実 HSCTOOL の AddEntry が PK 値を "Ignore" に上書きする可能性があるため、
+	/// AddEntry が PK 値を "Ignore" に上書きするため、
 	/// AddEntry 呼び出し前に元の値を退避し、WriteDiffCsvAsync で条件付き Ignore を実装する。
 	/// Key = diff.Entries のインデックス, Value = { pkColName: (srcVal, tgtVal) }
 	/// </summary>
@@ -497,7 +497,6 @@ public class MySqlVerifierService
 		// WriteDiffCsvAsync で使用するためにインスタンスフィールドに退避
 		_ignorePkColumns = ignorePkColumns;
 		_modifyOriginalPks = new Dictionary<int, Dictionary<string, (object? src, object? tgt)>>();
-
 		var dateTimeKey = tableConfig.ModifiedKey;
 		var allColumns = pkColumns.Concat(compareColumns).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
 		var diff = new MySqlVerifierDiff();
@@ -567,9 +566,9 @@ public class MySqlVerifierService
 			{
 				var srcGroup = srcGroups.GetValueOrDefault(key) ?? new List<Dictionary<string, object?>>();
 				var tgtGroup = tgtGroups.GetValueOrDefault(key) ?? new List<Dictionary<string, object?>>();
-					CompareRowSets(diff, pkColumns, nonPkCompareColumns, alternativeKey, srcGroup, tgtGroup,
-						unmatchedSrcOut: srcOnlyRows, unmatchedTgtOut: tgtOnlyRows, ignorePkColumns: ignorePkColumns,
-						modifyOriginalPks: _modifyOriginalPks);
+								CompareRowSets(diff, pkColumns, nonPkCompareColumns, alternativeKey, srcGroup, tgtGroup,
+							unmatchedSrcOut: srcOnlyRows, unmatchedTgtOut: tgtOnlyRows, ignorePkColumns: ignorePkColumns,
+							modifyOriginalPks: _modifyOriginalPks);
 			}
 		}
 
@@ -623,10 +622,10 @@ public class MySqlVerifierService
 					var altKey = AltKey(finalTgtOnly[i]);
 					if (matchedSrcByAltKey.TryGetValue(altKey, out var srcCandidates) && srcCandidates.Count > 0)
 					{
-								var srcRow = srcCandidates[0];
+									var srcRow = srcCandidates[0];
 						srcCandidates.RemoveAt(0);
 							StoreOriginalPks(_modifyOriginalPks, diff, srcRow, finalTgtOnly[i], ignorePkColumns);
-							diff.AddEntry(DiffType.Modify, pkColumns, srcRow, finalTgtOnly[i], nonPkCompareColumns);
+								diff.AddEntry(DiffType.Modify, pkColumns, srcRow, finalTgtOnly[i], nonPkCompareColumns);
 						resolved.Add(i);
 					}
 				}
@@ -659,10 +658,10 @@ public class MySqlVerifierService
 					var altKey = AltKey(finalSrcOnly[i]);
 					if (matchedTgtByAltKey.TryGetValue(altKey, out var tgtCandidates) && tgtCandidates.Count > 0)
 					{
-								var tgtRow = tgtCandidates[0];
+									var tgtRow = tgtCandidates[0];
 						tgtCandidates.RemoveAt(0);
-						StoreOriginalPks(_modifyOriginalPks, diff, finalSrcOnly[i], tgtRow, ignorePkColumns);
-						diff.AddEntry(DiffType.Modify, pkColumns, finalSrcOnly[i], tgtRow, nonPkCompareColumns);
+							StoreOriginalPks(_modifyOriginalPks, diff, finalSrcOnly[i], tgtRow, ignorePkColumns);
+							diff.AddEntry(DiffType.Modify, pkColumns, finalSrcOnly[i], tgtRow, nonPkCompareColumns);
 						resolved.Add(i);
 					}
 				}
@@ -785,7 +784,7 @@ public class MySqlVerifierService
 			var pairCount = Math.Min(srcIndices.Count, tgtIndices.Count);
 			for (int i = 0; i < pairCount; i++)
 			{
-				pairedSrc.Add(srcIndices[i]);
+					pairedSrc.Add(srcIndices[i]);
 				pairedTgt.Add(tgtIndices[i]);
 				if (modifyOriginalPks != null)
 					StoreOriginalPks(modifyOriginalPks, diff, unmatchedSrc[srcIndices[i]], unmatchedTgt[tgtIndices[i]], setPkIgnoreCols);
@@ -1186,18 +1185,19 @@ public class MySqlVerifierService
 		var headerLine = string.Join(",", new[] { "DiffType" }.Concat(allColumns));
 		var headerBytes = Encoding.UTF8.GetByteCount(headerLine + Environment.NewLine);
 
-		// diff.Entries から直接 CSV 行を生成（BuildCsvLine を経由しない）
-		// → _modifyOriginalPks に退避した元の PK 値を使って条件付き Ignore を適用
-		var lines = new List<string>();
-		for (int entryIdx = 0; entryIdx < diff.Entries.Count; entryIdx++)
-		{
-			var entry = diff.Entries[entryIdx];
-			var cells = allColumns.Select(col =>
+			// diff.Entries から直接 CSV 行を生成
+			// Modify 行の PK カラムは _modifyOriginalPks に退避した元の値で条件付き Ignore を適用
+			var lines = new List<string>();
+			for (int entryIdx = 0; entryIdx < diff.Entries.Count; entryIdx++)
 			{
+				var entry = diff.Entries[entryIdx];
+				var cells = allColumns.Select(col =>
+				{
 					if (entry.DiffType == DiffType.Modify)
 					{
-						// IgnorePK モード: PK カラムは ChangedColumns より先に条件付き Ignore を適用
-						// （AddEntry に元の PK 値を渡すため、PK が ChangedColumns に含まれる場合がある）
+						// IgnorePK モード: PK カラムは _modifyOriginalPks から元の値を取得して比較
+						// （AddEntry が PK 値を "Ignore" に上書きするため、entry.SourceValues/TargetValues は使えない）
+						// ソース PK == ターゲット PK → 実値を表示、異なる → "Ignore"
 						if (ignorePk && ignorePkSet.Contains(col)
 							&& _modifyOriginalPks.TryGetValue(entryIdx, out var origPks)
 							&& origPks.TryGetValue(col, out var pkPair))
